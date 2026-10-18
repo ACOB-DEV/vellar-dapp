@@ -13,7 +13,42 @@ import { summarizeError, type DLQStore, type DLQRecord } from "./dlq-store";
 import type { PolicyDeployer } from "./deploy";
 import type { PolicyRepository, PolicyRecord } from "./server";
 
-export const MAX_RETRIES = 5; // Configurable per job type
+export const DEFAULT_DLQ_THRESHOLD = 5;
+export const DEFAULT_MAX_ATTEMPTS = 3;
+export const MAX_RETRIES = DEFAULT_DLQ_THRESHOLD; // Configurable per job type
+
+/**
+ * Terminal error indicating a permanent failure that cannot succeed upon retry.
+ */
+export class TerminalDeployError extends Error {
+  readonly isTerminal = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "TerminalDeployError";
+  }
+}
+
+/**
+ * Classifies an error as terminal (permanent) vs retryable (transient).
+ */
+export function isTerminalFailure(error: unknown): boolean {
+  if (!error) return false;
+  if (typeof error === "object" && "isTerminal" in error && Boolean((error as any).isTerminal)) {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  const terminalPatterns = [
+    /policy not found/i,
+    /not contract-enforced/i,
+    /invalid template/i,
+    /unknown policy type/i,
+    /missing constructor args/i,
+    /schema version .* does not exist/i,
+    /unattributable publisher/i,
+    /terminal/i,
+  ];
+  return terminalPatterns.some((pattern) => pattern.test(message));
+}
 
 export interface DeployJob {
   id: string; // Job id (UUID)
@@ -22,6 +57,7 @@ export interface DeployJob {
   network: "testnet" | "mainnet";
   status: "pending" | "in_progress" | "completed" | "failed" | "dead";
   retry_count: number;
+  max_attempts?: number; // Configurable per-job distinct from DLQ threshold
   last_error?: string;
   last_failed_at?: string;
   first_failed_at?: string;
@@ -42,7 +78,7 @@ export interface DeployJobStore {
   markCompleted(jobId: string, contractId: string, txHash: string): Promise<void>;
 
   /**
-   * Handle job failure: increment retry_count or move to DLQ if exceeded.
+   * Handle job failure: increment retry_count or move to DLQ if exceeded or terminal.
    * This must be atomic to prevent races under concurrent workers.
    */
   handleFailure(
@@ -50,12 +86,18 @@ export interface DeployJobStore {
     error: unknown,
     dlqStore: DLQStore,
     dlqMetrics?: DLQMetrics,
+    options?: { maxAttempts?: number; dlqThreshold?: number },
   ): Promise<void>;
 
   /**
    * Get current job state (for testing and diagnostics).
    */
   get(jobId: string): Promise<DeployJob | undefined>;
+
+  /**
+   * Add a job to the store (for testing or requeue).
+   */
+  addJob?(job: DeployJob): Promise<void> | void;
 }
 
 export interface DLQMetrics {
@@ -68,6 +110,13 @@ export interface DLQMetrics {
 export class InMemoryDeployJobStore implements DeployJobStore {
   private jobs = new Map<string, DeployJob>();
   private nextJobId = 0;
+  maxAttempts?: number;
+  dlqThreshold: number;
+
+  constructor(options?: { maxAttempts?: number; dlqThreshold?: number }) {
+    this.maxAttempts = options?.maxAttempts;
+    this.dlqThreshold = options?.dlqThreshold ?? MAX_RETRIES;
+  }
 
   async claim(): Promise<DeployJob | undefined> {
     for (const job of this.jobs.values()) {
@@ -92,6 +141,7 @@ export class InMemoryDeployJobStore implements DeployJobStore {
     error: unknown,
     dlqStore: DLQStore,
     dlqMetrics?: DLQMetrics,
+    options?: { maxAttempts?: number; dlqThreshold?: number },
   ): Promise<void> {
     const job = this.jobs.get(jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
@@ -103,7 +153,15 @@ export class InMemoryDeployJobStore implements DeployJobStore {
     if (!job.first_failed_at) job.first_failed_at = now;
     job.updated_at = now;
 
-    if (job.retry_count > MAX_RETRIES) {
+    const isTerminal = isTerminalFailure(error);
+    const configuredMaxAttempts = options?.maxAttempts ?? job.max_attempts ?? this.maxAttempts;
+    const configuredDlqThreshold = options?.dlqThreshold ?? this.dlqThreshold;
+
+    const exceedsMaxAttempts =
+      configuredMaxAttempts !== undefined && job.retry_count >= configuredMaxAttempts;
+    const exceedsDlqThreshold = job.retry_count > configuredDlqThreshold;
+
+    if (isTerminal || exceedsMaxAttempts || exceedsDlqThreshold) {
       // Move to DLQ
       job.status = "dead";
       const dlqRecord = await dlqStore.insert({
@@ -114,6 +172,7 @@ export class InMemoryDeployJobStore implements DeployJobStore {
           wallet: job.wallet,
           network: job.network,
           policy_id: job.policy_id,
+          terminal: isTerminal,
         },
         last_error: job.last_error,
         failure_count: job.retry_count,
@@ -134,6 +193,7 @@ export class InMemoryDeployJobStore implements DeployJobStore {
           original_job_id: jobId,
           reason: job.last_error,
           retry_count: job.retry_count,
+          terminal: isTerminal,
         },
       });
     } else {
@@ -187,12 +247,12 @@ export async function processDeploymentJob(
   try {
     const policy = await policyRepo.find(job.policy_id);
     if (!policy) {
-      throw new Error(`Policy not found: ${job.policy_id}`);
+      throw new TerminalDeployError(`Policy not found: ${job.policy_id}`);
     }
 
     const enforcement = policy.manifest.enforcement;
     if (enforcement.kind !== "policy-contract" || !enforcement.constructorArgs) {
-      throw new Error(`Policy is not contract-enforced: ${job.policy_id}`);
+      throw new TerminalDeployError(`Policy is not contract-enforced: ${job.policy_id}`);
     }
     const result = await deployer.deployInstance({
       wallet: job.wallet,

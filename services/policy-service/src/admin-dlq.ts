@@ -11,7 +11,7 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { z } from "zod";
-import type { DeployJobStore, DLQMetrics } from "./policy-deploy-worker";
+import type { DeployJob, DeployJobStore, DLQMetrics } from "./policy-deploy-worker";
 import type { DLQStore, DLQRecord } from "./dlq-store";
 import type { PolicyRepository } from "./server";
 
@@ -157,11 +157,25 @@ export function registerAdminDLQRoutes(app: FastifyInstance, deps: AdminDLQDeps)
       });
 
       // Extract payload and create new job
-      const payload = dlqRecord.payload as Record<string, unknown>;
+      const payload = (dlqRecord.payload ?? {}) as Record<string, unknown>;
       const newJobId = randomUUID();
+      const newJob: DeployJob = {
+        id: newJobId,
+        policy_id: dlqRecord.policy_id,
+        wallet: (payload.wallet as string) ?? "",
+        network: (payload.network as "testnet" | "mainnet") ?? "testnet",
+        status: "pending",
+        retry_count: 0,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
 
-      // In production, this would insert a job into the job queue store
-      // For now, we'll just record the audit event
+      if ("addJob" in jobStore && typeof (jobStore as any).addJob === "function") {
+        (jobStore as any).addJob(newJob);
+      } else if ("insertJob" in jobStore && typeof (jobStore as any).insertJob === "function") {
+        await (jobStore as any).insertJob(newJob);
+      }
+
       const now = new Date().toISOString();
       await dlqStore.update(dlqId, {
         requeue_count: dlqRecord.requeue_count + 1,

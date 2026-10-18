@@ -338,6 +338,95 @@ describe("Admin DLQ API", () => {
         job_type: "policy_deploy",
       });
     });
+
+    it("enqueues a new pending job in jobStore with payload data (#527)", async () => {
+      const entry = await dlqStore.insert({
+        original_job_id: "original-job-42",
+        policy_id: "policy-xyz",
+        job_type: "policy_deploy",
+        payload: { wallet: "CWALLET123", network: "testnet" },
+        last_error: "Transient network failure",
+        failure_count: 6,
+        first_failed_at: new Date().toISOString(),
+        last_failed_at: new Date().toISOString(),
+      });
+
+      const res = await app.inject({
+        method: "POST",
+        url: `/admin/dlq/${entry.id}/requeue`,
+      });
+
+      expect(res.statusCode).toBe(201);
+      const { new_job_id } = res.json();
+      expect(new_job_id).toBeDefined();
+
+      const createdJob = await jobStore.get(new_job_id);
+      expect(createdJob).toBeDefined();
+      expect(createdJob?.policy_id).toBe("policy-xyz");
+      expect(createdJob?.wallet).toBe("CWALLET123");
+      expect(createdJob?.network).toBe("testnet");
+      expect(createdJob?.status).toBe("pending");
+      expect(createdJob?.retry_count).toBe(0);
+    });
+
+    it("leaves all other DLQ entries untouched when requeueing a single entry (#527)", async () => {
+      // Create three DLQ entries
+      const entry1 = await dlqStore.insert({
+        original_job_id: "job-1",
+        policy_id: "policy-1",
+        job_type: "policy_deploy",
+        payload: { wallet: "W1" },
+        last_error: "Error 1",
+        failure_count: 6,
+        first_failed_at: new Date().toISOString(),
+        last_failed_at: new Date().toISOString(),
+      });
+
+      const entry2 = await dlqStore.insert({
+        original_job_id: "job-2",
+        policy_id: "policy-2",
+        job_type: "policy_deploy",
+        payload: { wallet: "W2" },
+        last_error: "Error 2",
+        failure_count: 6,
+        first_failed_at: new Date().toISOString(),
+        last_failed_at: new Date().toISOString(),
+      });
+
+      const entry3 = await dlqStore.insert({
+        original_job_id: "job-3",
+        policy_id: "policy-3",
+        job_type: "policy_deploy",
+        payload: { wallet: "W3" },
+        last_error: "Error 3",
+        failure_count: 6,
+        first_failed_at: new Date().toISOString(),
+        last_failed_at: new Date().toISOString(),
+      });
+
+      // Capture snapshot of entry2 and entry3 before requeueing entry1
+      const entry2Before = await dlqStore.find(entry2.id);
+      const entry3Before = await dlqStore.find(entry3.id);
+
+      // Requeue ONLY entry1
+      const res = await app.inject({
+        method: "POST",
+        url: `/admin/dlq/${entry1.id}/requeue`,
+      });
+      expect(res.statusCode).toBe(201);
+
+      // Assert entry1 was updated
+      const entry1After = await dlqStore.find(entry1.id);
+      expect(entry1After?.requeue_count).toBe(1);
+
+      // Assert entry2 and entry3 were untouched
+      const entry2After = await dlqStore.find(entry2.id);
+      const entry3After = await dlqStore.find(entry3.id);
+      expect(entry2After).toEqual(entry2Before);
+      expect(entry3After).toEqual(entry3Before);
+      expect(entry2After?.requeue_count).toBe(0);
+      expect(entry3After?.requeue_count).toBe(0);
+    });
   });
 
   describe("POST /admin/dlq/:id/archive", () => {
