@@ -165,7 +165,11 @@ export function buildServer(deps: LifecycleServiceDeps): FastifyInstance {
 
     const account = await deps.reader.getAccount(accountId);
     if (!account) return reply.code(404).send({ error: "account_not_found" });
-    return reply.send({ plan: buildCleanupPlan(account, destination) });
+    const plan = buildCleanupPlan(account, destination);
+    if ("error" in plan) {
+      return reply.code(400).send({ error: plan.error, message: plan.message, plan });
+    }
+    return reply.send({ plan });
   });
 
   const passphrase = deps.networkPassphrase ?? TESTNET_PASSPHRASE;
@@ -265,9 +269,14 @@ export function buildServer(deps: LifecycleServiceDeps): FastifyInstance {
     const account = await deps.reader.getAccount(accountId);
     if (!account) return reply.code(404).send({ error: "account_not_found" });
 
+    const plan = buildCleanupPlan(account, destination);
+    if ("error" in plan) {
+      return reply.code(400).send({ error: plan.error, message: plan.message, plan });
+    }
+
     return reply.send({
       steps: buildCleanupSteps(account, destination, passphrase),
-      plan: buildCleanupPlan(account, destination),
+      plan,
     });
   });
 
@@ -286,6 +295,10 @@ export function buildServer(deps: LifecycleServiceDeps): FastifyInstance {
     if (!account) return reply.code(404).send({ error: "account_not_found" });
 
     const plan = buildCleanupPlan(account, destination);
+    if ("error" in plan) {
+      recordOutcome(domainMetrics.cleanupCompleted, "lifecycle-service", "failure");
+      return reply.code(400).send({ error: plan.error, message: plan.message, plan });
+    }
     if (!plan.mergeReady) {
       // §13 alerting: abnormal cleanup failure rates. A merge refused because
       // the account still has blockers is a "not ready" outcome, not success.

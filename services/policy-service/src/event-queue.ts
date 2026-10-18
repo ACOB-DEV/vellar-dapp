@@ -67,6 +67,8 @@ export interface ConsumerOptions {
   };
   /** Alerting callback invoked when a poison message is moved to quarantine. */
   onQuarantine?: (quarantined: QuarantinedMessage) => void;
+  /** Optional gauge metric to track queue backlog depth. Defaults to domainMetrics.policyEventQueueDepth. */
+  queueDepthGauge?: { set: (labels: { service: string }, value: number) => void };
 }
 
 export type ProcessOutcome = "success" | "retry" | "quarantined";
@@ -80,7 +82,7 @@ export interface ProcessResult {
 
 /**
  * PolicyEventQueueConsumer with automatic poison-message detection, quarantine isolation,
- * and ops alerting (Issue #297).
+ * ops alerting (Issue #297), and backlog-depth metrics exposed on /metrics (Issue #524).
  */
 export class PolicyEventQueue<T = unknown> {
   private queue: PolicyEventMessage<T>[] = [];
@@ -88,6 +90,7 @@ export class PolicyEventQueue<T = unknown> {
   private maxAttempts: number;
   private log: NonNullable<ConsumerOptions["log"]>;
   private onQuarantine?: ConsumerOptions["onQuarantine"];
+  private queueDepthGauge?: ConsumerOptions["queueDepthGauge"];
 
   constructor(options: ConsumerOptions = {}, quarantineQueue?: QuarantineQueue<T>) {
     const envAttempts = Number(process.env.POLICY_EVENT_MAX_ATTEMPTS);
@@ -100,6 +103,19 @@ export class PolicyEventQueue<T = unknown> {
       error: (msg, ...args) => console.error(`[policy-event-queue] ${msg}`, ...args),
     };
     this.onQuarantine = options.onQuarantine;
+    this.queueDepthGauge = options.queueDepthGauge;
+
+    // Initialize backlog-depth metric to 0 so empty queues are recorded (#524)
+    this.updateBacklogDepthMetric();
+  }
+
+  private updateBacklogDepthMetric(): void {
+    const depth = this.queue.length;
+    if (this.queueDepthGauge) {
+      this.queueDepthGauge.set({ service: "policy-service" }, depth);
+    } else {
+      domainMetrics.policyEventQueueDepth.set({ service: "policy-service" }, depth);
+    }
   }
 
   /**
@@ -122,6 +138,7 @@ export class PolicyEventQueue<T = unknown> {
       correlationId: event.correlationId,
     };
     this.queue.push(msg);
+    this.updateBacklogDepthMetric();
     return msg;
   }
 
@@ -146,7 +163,11 @@ export class PolicyEventQueue<T = unknown> {
     handler: (message: PolicyEventMessage<T>) => Promise<void>,
   ): Promise<ProcessResult | undefined> {
     const msg = this.queue.shift();
-    if (!msg) return undefined;
+    if (!msg) {
+      this.updateBacklogDepthMetric();
+      return undefined;
+    }
+    this.updateBacklogDepthMetric();
 
     msg.attempts += 1;
     const limit = msg.maxAttempts ?? this.maxAttempts;
@@ -203,6 +224,7 @@ export class PolicyEventQueue<T = unknown> {
           `Message ${msg.id} failed processing (attempt ${msg.attempts}/${limit}): ${reason}. Re-queueing.`,
         );
         this.queue.push(msg);
+        this.updateBacklogDepthMetric();
         return {
           messageId: msg.id,
           outcome: "retry",

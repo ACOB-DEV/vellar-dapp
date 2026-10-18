@@ -163,4 +163,67 @@ describe("createCachedAccountReader", () => {
       expect(underlying.getAccount).toHaveBeenCalledTimes(4);
     });
   });
+
+  describe("mid-TTL account closure (#532)", () => {
+    it("does not serve a stale closed-account entry after invalidation when account is closed mid-TTL", async () => {
+      let accountOnChain: HorizonAccount | undefined = account({ accountId: "GCLOSED" });
+      const underlying: AccountReader = {
+        getAccount: vi.fn(async (id: string) => (id === "GCLOSED" ? accountOnChain : undefined)),
+      };
+      const cached = createCachedAccountReader(underlying);
+
+      // 1. Initial read while open: cached entry is populated
+      const initial = await cached.getAccount("GCLOSED");
+      expect(initial).toBeDefined();
+      expect(initial?.accountId).toBe("GCLOSED");
+      expect(underlying.getAccount).toHaveBeenCalledTimes(1);
+
+      // 2. Account is closed on-chain mid-TTL (merged away by external actor)
+      accountOnChain = undefined;
+
+      // 3. Invalidate the cached account entry
+      cached.invalidate("GCLOSED");
+
+      // 4. Assert the cache does NOT serve a stale closed-account entry as if the account were still open
+      const afterClosure = await cached.getAccount("GCLOSED");
+      expect(afterClosure).toBeUndefined();
+      expect(underlying.getAccount).toHaveBeenCalledTimes(2);
+
+      // 5. Subsequent read serves the cached undefined (closed) without hitting underlying reader
+      const subsequent = await cached.getAccount("GCLOSED");
+      expect(subsequent).toBeUndefined();
+      expect(underlying.getAccount).toHaveBeenCalledTimes(2);
+    });
+
+    it("re-evaluates closed account after TTL expires without manual invalidation", async () => {
+      const clock = fakeClock();
+      let accountOnChain: HorizonAccount | undefined = account({ accountId: "GCLOSED_TTL" });
+      const underlying: AccountReader = {
+        getAccount: vi.fn(async (id: string) => (id === "GCLOSED_TTL" ? accountOnChain : undefined)),
+      };
+      const cached = createCachedAccountReader(underlying, { ttlMs: 1_000, now: clock.now });
+
+      // Warm cache while open
+      expect(await cached.getAccount("GCLOSED_TTL")).toBeDefined();
+
+      // Account is closed externally mid-TTL
+      accountOnChain = undefined;
+
+      // Within TTL: still served from cache
+      clock.advance(500);
+      expect(await cached.getAccount("GCLOSED_TTL")).toBeDefined();
+      expect(underlying.getAccount).toHaveBeenCalledTimes(1);
+
+      // Past TTL: cache re-fetches and detects the account is closed (undefined)
+      clock.advance(501);
+      const afterExpiry = await cached.getAccount("GCLOSED_TTL");
+      expect(afterExpiry).toBeUndefined();
+      expect(underlying.getAccount).toHaveBeenCalledTimes(2);
+
+      // Cached undefined is now retained
+      expect(await cached.getAccount("GCLOSED_TTL")).toBeUndefined();
+      expect(underlying.getAccount).toHaveBeenCalledTimes(2);
+    });
+  });
 });
+
