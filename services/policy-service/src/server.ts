@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import {
   registerHealth,
   registerMetrics,
@@ -31,6 +31,9 @@ import {
   verifyAndRecordAttach,
   type DeploymentDeps,
 } from "./deployment";
+import { registerAdminDLQRoutes } from "./admin-dlq";
+import type { DLQStore } from "./dlq-store";
+import type { DeployJobStore, DLQMetrics } from "./policy-deploy-worker";
 
 // Policy API (idea.md §11): validate → generate → (review) → deploy.
 // Generated policies persist for review/deploy (idea.md §9 policies table —
@@ -176,6 +179,14 @@ export interface PolicyServiceDeps {
   csrfTtlMs?: number;
   /** When true, enforces CSRF token validation on all state-changing endpoints. */
   enableCsrf?: boolean;
+  /** DLQ store for dead-letter queue operations. */
+  dlqStore?: DLQStore;
+  /** Deploy job store for job requeue operations. */
+  jobStore?: DeployJobStore;
+  /** DLQ metrics for tracking requeues. */
+  dlqMetrics?: Pick<DLQMetrics, "dlq_requeue_total">;
+  /** Admin user extractor. */
+  getAdminUser?: (request: FastifyRequest) => string | undefined;
 }
 
 export function buildServer(deps: PolicyServiceDeps = {}): FastifyInstance {
@@ -204,6 +215,16 @@ export function buildServer(deps: PolicyServiceDeps = {}): FastifyInstance {
   registerHealth(app, "policy-service", { isReady: deps.isReady });
   registerMetrics(app, "policy-service");
 
+  if (deps.dlqStore && deps.jobStore) {
+    registerAdminDLQRoutes(app, {
+      dlqStore: deps.dlqStore,
+      jobStore: deps.jobStore,
+      policyRepo: policies,
+      dlqMetrics: deps.dlqMetrics,
+      getAdminUser: deps.getAdminUser,
+    });
+  }
+
   const csrfPreHandler = createCsrfPreHandler({
     secret: csrfSecret,
     ttlMs: deps.csrfTtlMs,
@@ -226,8 +247,9 @@ export function buildServer(deps: PolicyServiceDeps = {}): FastifyInstance {
   app.get("/csrf-token", getCsrfTokenHandler);
 
   app.get("/policies/templates", async () =>
-    templates.map(({ type, title, description, enforcement }) => ({
+    templates.map(({ type, schemaVersion, title, description, enforcement }) => ({
       type,
+      schemaVersion,
       title,
       description,
       enforcement,
@@ -292,7 +314,7 @@ export function buildServer(deps: PolicyServiceDeps = {}): FastifyInstance {
         try {
           const generated = generatePolicy(
             item.definition as PolicyDefinition,
-            item.network,
+            (item.network as "testnet" | "mainnet") ?? "testnet",
           );
           const record: PolicyRecord = {
             id: randomUUID(),
@@ -667,3 +689,5 @@ export function buildServer(deps: PolicyServiceDeps = {}): FastifyInstance {
 
   return app;
 }
+
+export const createPolicyService = buildServer;
