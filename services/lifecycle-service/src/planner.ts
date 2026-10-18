@@ -16,7 +16,86 @@ export function isClassicAccountId(value: string): boolean {
 /** Operations fit ~100 to a transaction; the final merge is its own tx. */
 const OPS_PER_TX = 100;
 
-export function buildCleanupPlan(account: HorizonAccount, destination: string): CleanupPlan {
+export const BASE_RESERVE_STROOPS = 5_000_000n; // 0.5 XLM per subentry
+export const BASE_FEE_STROOPS = 100n; // 100 stroops per operation
+
+export interface InsufficientSpendableBalanceResult {
+  canSelfFund: false;
+  error: "insufficient_spendable_balance";
+  message: string;
+  spendableBalanceXlm: string;
+  requiredFeeXlm: string;
+  spendableBalanceStroops: string;
+  requiredFeeStroops: string;
+  accountId: string;
+  destination: string;
+  blockers: CleanupPlan["blockers"];
+  estimatedTransactions: number;
+  mergeReady: false;
+}
+
+export type CleanupPlanResult = CleanupPlan | InsufficientSpendableBalanceResult;
+
+export function calculateSpendableBalanceStroops(account: HorizonAccount): bigint {
+  const native = account.balances.find((b) => b.assetType === "native");
+  const nativeStroops = native ? BigInt(Math.round(Number(native.balance) * 10_000_000)) : 0n;
+  const subentries =
+    account.subentryCount !== undefined
+      ? account.subentryCount
+      : account.balances.filter((b) => b.assetType !== "native").length +
+        account.openOffers +
+        account.dataKeys.length;
+  const reserveStroops = BigInt(2 + subentries) * BASE_RESERVE_STROOPS;
+  return nativeStroops > reserveStroops ? nativeStroops - reserveStroops : 0n;
+}
+
+export function calculateRequiredFeeStroops(account: HorizonAccount): bigint {
+  let cleanupOps = 0;
+  for (const balance of account.balances) {
+    if (balance.assetType === "native") continue;
+    if (Number(balance.balance) > 0) cleanupOps++; // payment
+    cleanupOps++; // trustline removal
+  }
+  cleanupOps += account.openOffers; // one manageSellOffer per open offer
+  cleanupOps += account.dataKeys.length; // one manageData per entry
+  const totalOps = Math.max(1, cleanupOps);
+  return BigInt(totalOps) * BASE_FEE_STROOPS;
+}
+
+export function buildCleanupPlan(
+  account: HorizonAccount,
+  destination: string,
+): CleanupPlanResult {
+  // Safety check: refuse to build a plan if pagination was cut short (#531)
+  if (account.paginationIncomplete) {
+    throw new Error(
+      "Cannot build cleanup plan: account trustline pagination is incomplete or was cut short by an error",
+    );
+  }
+
+  // Preflight check: account must have sufficient spendable balance to self-fund (#529)
+  const spendableStroops = calculateSpendableBalanceStroops(account);
+  const requiredFeeStroops = calculateRequiredFeeStroops(account);
+
+  if (spendableStroops < requiredFeeStroops) {
+    const spendableXlm = (Number(spendableStroops) / 10_000_000).toFixed(7);
+    const requiredXlm = (Number(requiredFeeStroops) / 10_000_000).toFixed(7);
+    return {
+      canSelfFund: false,
+      error: "insufficient_spendable_balance",
+      message: `Account cannot self-fund its own cleanup: spendable balance (${spendableXlm} XLM) is less than the required fee (${requiredXlm} XLM)`,
+      spendableBalanceXlm: spendableXlm,
+      requiredFeeXlm: requiredXlm,
+      spendableBalanceStroops: spendableStroops.toString(),
+      requiredFeeStroops: requiredFeeStroops.toString(),
+      accountId: account.accountId,
+      destination,
+      blockers: [],
+      estimatedTransactions: 0,
+      mergeReady: false,
+    };
+  }
+
   const blockers: CleanupPlan["blockers"] = [];
 
   for (const balance of account.balances) {

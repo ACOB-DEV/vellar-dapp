@@ -27,11 +27,13 @@ export interface HorizonAccount {
   accountId: string;
   /** Current sequence number (needed to build transactions). */
   sequence: string;
+  subentryCount?: number;
   balances: HorizonBalance[];
   /** Managed-data entry keys. */
   dataKeys: string[];
   offers: HorizonOffer[];
   openOffers: number;
+  paginationIncomplete?: boolean;
 }
 
 export interface AccountReader {
@@ -51,6 +53,8 @@ export interface HorizonReaderOptions {
   /** Safety cap on offer pages followed, so a misbehaving `next` can't loop
    * forever (200 offers/page ⇒ 50 pages = 10k offers, far past any real account). */
   maxOfferPages?: number;
+  /** Safety cap on trustline pages followed. */
+  maxTrustlinePages?: number;
   /** Retry options for transient Horizon failures (5xx, network errors).
    * 404s and validation errors are never retried. Defaults: 3 attempts,
    * 200 ms base delay, 5 s ceiling. Pass `{ maxAttempts: 1 }` to disable. */
@@ -63,6 +67,7 @@ export interface HorizonReaderOptions {
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_OFFER_PAGES = 50;
+const DEFAULT_MAX_TRUSTLINE_PAGES = 50;
 const OFFERS_PAGE_LIMIT = 200;
 
 // Runtime shapes: Horizon is an external service, so its responses are
@@ -74,18 +79,41 @@ const assetRefSchema = z.object({
   asset_issuer: z.string().optional(),
 });
 
+const balanceRecordSchema = z.object({
+  asset_type: z.string(),
+  asset_code: z.string().optional(),
+  asset_issuer: z.string().optional(),
+  balance: z.string(),
+});
+
 const accountSchema = z.object({
   sequence: z.string(),
-  balances: z.array(
-    z.object({
-      asset_type: z.string(),
-      asset_code: z.string().optional(),
-      asset_issuer: z.string().optional(),
-      balance: z.string(),
-    }),
-  ),
+  subentry_count: z.number().optional(),
+  balances: z.array(balanceRecordSchema),
   data: z.record(z.string(), z.string()).default({}),
+  _links: z
+    .object({
+      next: z.object({ href: z.string() }).optional(),
+      balances: z.object({ href: z.string() }).optional(),
+      trustlines: z.object({ href: z.string() }).optional(),
+    })
+    .optional(),
 });
+
+const trustlinesPageSchema = z.union([
+  z.object({
+    balances: z.array(balanceRecordSchema),
+    _links: z.object({ next: z.object({ href: z.string() }).optional() }).optional(),
+  }),
+  z.object({
+    _embedded: z.object({ records: z.array(balanceRecordSchema) }),
+    _links: z.object({ next: z.object({ href: z.string() }).optional() }).optional(),
+  }),
+  z.object({
+    records: z.array(balanceRecordSchema),
+    _links: z.object({ next: z.object({ href: z.string() }).optional() }).optional(),
+  }),
+]);
 
 const offerRecordSchema = z.object({
   id: z.union([z.string(), z.number()]).transform(String),
@@ -107,6 +135,7 @@ export function createHorizonAccountReader(
   const doFetch = options.fetchImpl ?? fetch;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxOfferPages = options.maxOfferPages ?? DEFAULT_MAX_OFFER_PAGES;
+  const maxTrustlinePages = options.maxTrustlinePages ?? DEFAULT_MAX_TRUSTLINE_PAGES;
   const retryOpts = {
     maxAttempts: options.retryOptions?.maxAttempts ?? 3,
     baseDelayMs: options.retryOptions?.baseDelayMs ?? 200,
@@ -143,6 +172,64 @@ export function createHorizonAccountReader(
         },
       },
     );
+  }
+
+  async function fetchAllBalances(
+    initialBalances: HorizonBalance[],
+    initialNext?: string,
+  ): Promise<HorizonBalance[]> {
+    const balances: HorizonBalance[] = [...initialBalances];
+    let nextUrl = initialNext;
+    if (!nextUrl) return balances;
+
+    for (let page = 1; page < maxTrustlinePages; page++) {
+      let body: unknown;
+      try {
+        const res = await fetchJson(nextUrl, "trustlines fetch");
+        body = res.body;
+      } catch (err) {
+        throw new Error(
+          `Horizon trustlines pagination failed: pagination was cut short by an error (${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
+
+      const parsed = trustlinesPageSchema.safeParse(body);
+      if (!parsed.success) {
+        throw new Error(`Horizon trustlines response was malformed: ${parsed.error.message}`);
+      }
+
+      let records: Array<{
+        asset_type: string;
+        asset_code?: string;
+        asset_issuer?: string;
+        balance: string;
+      }> = [];
+
+      if ("balances" in parsed.data) {
+        records = parsed.data.balances;
+      } else if ("_embedded" in parsed.data) {
+        records = parsed.data._embedded.records;
+      } else if ("records" in parsed.data) {
+        records = parsed.data.records;
+      }
+
+      if (records.length === 0) break;
+
+      for (const b of records) {
+        balances.push({
+          assetType: b.asset_type,
+          assetCode: b.asset_code,
+          assetIssuer: b.asset_issuer,
+          balance: b.balance,
+        });
+      }
+
+      const next = parsed.data._links?.next?.href;
+      if (!next) break;
+      nextUrl = next;
+    }
+
+    return balances;
   }
 
   async function fetchAllOffers(accountId: string): Promise<HorizonOffer[]> {
@@ -189,17 +276,27 @@ export function createHorizonAccountReader(
         throw new Error(`Horizon account response was malformed: ${parsed.error.message}`);
       }
       const account = parsed.data;
+
+      const initialBalances: HorizonBalance[] = account.balances.map((b) => ({
+        assetType: b.asset_type,
+        assetCode: b.asset_code,
+        assetIssuer: b.asset_issuer,
+        balance: b.balance,
+      }));
+
+      const nextTrustlineHref =
+        account._links?.balances?.href ??
+        account._links?.trustlines?.href ??
+        account._links?.next?.href;
+
+      const balances = await fetchAllBalances(initialBalances, nextTrustlineHref);
       const offers = await fetchAllOffers(accountId);
 
       return {
         accountId,
         sequence: account.sequence,
-        balances: account.balances.map((b) => ({
-          assetType: b.asset_type,
-          assetCode: b.asset_code,
-          assetIssuer: b.asset_issuer,
-          balance: b.balance,
-        })),
+        subentryCount: account.subentry_count,
+        balances,
         dataKeys: Object.keys(account.data ?? {}),
         offers,
         openOffers: offers.length,

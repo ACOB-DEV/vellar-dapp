@@ -127,4 +127,77 @@ describe("PolicyEventQueue — Poison-message detection & quarantine (Issue #297
     expect(badResult?.outcome).toBe("quarantined");
     expect(await queue.getQuarantine().count()).toBe(1);
   });
+
+  describe("backlog-depth metrics exposed on /metrics (#524)", () => {
+    it("reports metric reading zero when queue is empty", async () => {
+      __resetMetricsForTest();
+      // Initialize an empty queue
+      new PolicyEventQueue();
+
+      const metricsText = await metricsRegistry().metrics();
+      expect(metricsText).toContain("vela_policy_event_queue_depth");
+      expect(metricsText).toMatch(
+        /vela_policy_event_queue_depth\{[^}]*service="policy-service"[^}]*\}\s+0/,
+      );
+    });
+
+    it("tracks backlog depth accurately as items are enqueued and processed", async () => {
+      __resetMetricsForTest();
+      const queue = new PolicyEventQueue();
+
+      // Enqueue 2 items
+      await queue.enqueue({ eventType: "policy.one", payload: { id: "1" } });
+      await queue.enqueue({ eventType: "policy.two", payload: { id: "2" } });
+
+      let metricsText = await metricsRegistry().metrics();
+      expect(metricsText).toMatch(
+        /vela_policy_event_queue_depth\{[^}]*service="policy-service"[^}]*\}\s+2/,
+      );
+
+      // Process 1 item successfully
+      await queue.processNext(async () => {});
+      metricsText = await metricsRegistry().metrics();
+      expect(metricsText).toMatch(
+        /vela_policy_event_queue_depth\{[^}]*service="policy-service"[^}]*\}\s+1/,
+      );
+
+      // Process the second item
+      await queue.processNext(async () => {});
+      metricsText = await metricsRegistry().metrics();
+      expect(metricsText).toMatch(
+        /vela_policy_event_queue_depth\{[^}]*service="policy-service"[^}]*\}\s+0/,
+      );
+    });
+
+    it("maintains accurate backlog depth when a message fails and is re-queued or quarantined", async () => {
+      __resetMetricsForTest();
+      const queue = new PolicyEventQueue({ maxAttempts: 2 });
+
+      await queue.enqueue({ eventType: "policy.failing", payload: { fail: true } });
+
+      let metricsText = await metricsRegistry().metrics();
+      expect(metricsText).toMatch(
+        /vela_policy_event_queue_depth\{[^}]*service="policy-service"[^}]*\}\s+1/,
+      );
+
+      // Attempt 1: fails and is re-queued -> backlog depth is still 1
+      await queue.processNext(async () => {
+        throw new Error("Temporary failure");
+      });
+      metricsText = await metricsRegistry().metrics();
+      expect(metricsText).toMatch(
+        /vela_policy_event_queue_depth\{[^}]*service="policy-service"[^}]*\}\s+1/,
+      );
+
+      // Attempt 2: fails again and is quarantined -> backlog depth becomes 0
+      await queue.processNext(async () => {
+        throw new Error("Temporary failure");
+      });
+      metricsText = await metricsRegistry().metrics();
+      expect(metricsText).toMatch(
+        /vela_policy_event_queue_depth\{[^}]*service="policy-service"[^}]*\}\s+0/,
+      );
+    });
+  });
 });
+
