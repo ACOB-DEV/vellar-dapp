@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { Keypair, TransactionBuilder } from "@stellar/stellar-sdk";
-import { buildCleanupSteps, buildMergeStep, OPS_PER_TX } from "./builder";
+import {
+  buildCleanupSteps,
+  buildMergeStep,
+  createPlanTracking,
+  recordStepConfirmation,
+  resumeCleanupPlan,
+  OPS_PER_TX,
+} from "./builder";
 import type { HorizonAccount } from "./horizon";
 
 const PASSPHRASE = "Test SDF Network ; September 2015";
@@ -167,5 +174,175 @@ describe("buildMergeStep", () => {
     const step = buildMergeStep(acct, DEST, PASSPHRASE);
     expect(decode(step.xdr).ops).toBe(1);
     expect(decode(step.xdr).sequence).toBe(501n);
+  });
+});
+
+describe("Issue #530: Multi-step cleanup confirmation tracking & resume path", () => {
+  it("tracks per-step confirmation state and records confirmations by index or hash", () => {
+    const acct = account({ dataKeys: dataKeys(250) }); // 3 steps: 100, 100, 50
+    const steps = buildCleanupSteps(acct, DEST, PASSPHRASE);
+    expect(steps).toHaveLength(3);
+
+    let tracking = createPlanTracking(acct, DEST, steps);
+    expect(tracking.totalSteps).toBe(3);
+    expect(tracking.steps[0]?.confirmed).toBe(false);
+    expect(tracking.steps[1]?.confirmed).toBe(false);
+    expect(tracking.steps[2]?.confirmed).toBe(false);
+
+    // Confirm step 0 by index
+    tracking = recordStepConfirmation(tracking, 0);
+    expect(tracking.steps[0]?.confirmed).toBe(true);
+    expect(tracking.steps[0]?.confirmedAt).toBeDefined();
+
+    // Confirm step 1 by hash
+    tracking = recordStepConfirmation(tracking, steps[1]!.hash);
+    expect(tracking.steps[1]?.confirmed).toBe(true);
+    expect(tracking.steps[2]?.confirmed).toBe(false);
+  });
+
+  it("happy path: resumes from step 2 after steps 0 and 1 confirmed, rebuilding only unconfirmed steps", () => {
+    const acct = account({ sequence: "100", dataKeys: dataKeys(250) });
+    const steps = buildCleanupSteps(acct, DEST, PASSPHRASE);
+    expect(steps).toHaveLength(3);
+
+    let tracking = createPlanTracking(acct, DEST, steps);
+    // Confirm step 0 and step 1
+    tracking = recordStepConfirmation(tracking, 0);
+    tracking = recordStepConfirmation(tracking, 1);
+
+    // After step 0 and step 1 submit on-chain, sequence is now 102, and remaining dataKeys are k200..k249 (50 keys)
+    const onChainAccount = account({
+      accountId: acct.accountId,
+      sequence: "102",
+      dataKeys: dataKeys(250).slice(200), // remaining 50 keys
+    });
+
+    const result = resumeCleanupPlan({
+      currentAccount: onChainAccount,
+      destination: DEST,
+      networkPassphrase: PASSPHRASE,
+      tracking,
+    });
+
+    expect(result.status).toBe("resumed");
+    if (result.status === "resumed") {
+      expect(result.resumedFromStep).toBe(2);
+      expect(result.completedStepCount).toBe(2);
+      expect(result.totalSteps).toBe(3);
+      expect(result.remainingSteps).toHaveLength(1);
+      // Sequence of remaining step starts at 103 (102 + 1)
+      expect(decode(result.remainingSteps[0]!.xdr).sequence).toBe(103n);
+      expect(decode(result.remainingSteps[0]!.xdr).ops).toBe(50);
+    }
+  });
+
+  it("failure mode: requires fresh plan when an earlier step's on-chain trustline balance changed", () => {
+    const USDC = { assetType: "credit_alphanum4", assetCode: "USDC", assetIssuer: DEST };
+    const acct = account({
+      sequence: "100",
+      balances: [
+        { assetType: "native", balance: "100.0" },
+        { ...USDC, balance: "50" },
+      ],
+      dataKeys: dataKeys(150),
+    });
+    const steps = buildCleanupSteps(acct, DEST, PASSPHRASE);
+    let tracking = createPlanTracking(acct, DEST, steps);
+
+    // Step 0 confirmed
+    tracking = recordStepConfirmation(tracking, 0);
+
+    // But on-chain, someone unexpectedly transferred more USDC or balance changed from 50 to 100
+    const changedAccount = account({
+      accountId: acct.accountId,
+      sequence: "101",
+      balances: [
+        { assetType: "native", balance: "100.0" },
+        { ...USDC, balance: "100" }, // Changed!
+      ],
+      dataKeys: dataKeys(150),
+    });
+
+    const result = resumeCleanupPlan({
+      currentAccount: changedAccount,
+      destination: DEST,
+      networkPassphrase: PASSPHRASE,
+      tracking,
+    });
+
+    expect(result.status).toBe("fresh_plan_required");
+    if (result.status === "fresh_plan_required") {
+      expect(result.reason).toContain("trustline balance");
+      expect(result.reason).toContain("changed");
+    }
+  });
+
+  it("failure mode: requires fresh plan when a brand-new unexpected trustline appears on-chain", () => {
+    const acct = account({ dataKeys: dataKeys(150) });
+    const steps = buildCleanupSteps(acct, DEST, PASSPHRASE);
+    let tracking = createPlanTracking(acct, DEST, steps);
+    tracking = recordStepConfirmation(tracking, 0);
+
+    // New unexpected trustline balance appears
+    const changedAccount = account({
+      accountId: acct.accountId,
+      sequence: "101",
+      balances: [
+        { assetType: "native", balance: "100.0" },
+        { assetType: "credit_alphanum4", assetCode: "NEWCOIN", assetIssuer: DEST, balance: "10" },
+      ],
+      dataKeys: dataKeys(50),
+    });
+
+    const result = resumeCleanupPlan({
+      currentAccount: changedAccount,
+      destination: DEST,
+      networkPassphrase: PASSPHRASE,
+      tracking,
+    });
+
+    expect(result.status).toBe("fresh_plan_required");
+    if (result.status === "fresh_plan_required") {
+      expect(result.reason).toContain("unexpected new asset");
+    }
+  });
+
+  it("failure mode: requires fresh plan if step confirmation order has non-contiguous gaps", () => {
+    const acct = account({ dataKeys: dataKeys(250) });
+    const steps = buildCleanupSteps(acct, DEST, PASSPHRASE);
+    let tracking = createPlanTracking(acct, DEST, steps);
+
+    // Step 1 marked confirmed before step 0
+    tracking = recordStepConfirmation(tracking, 1);
+
+    const result = resumeCleanupPlan({
+      currentAccount: acct,
+      destination: DEST,
+      networkPassphrase: PASSPHRASE,
+      tracking,
+    });
+
+    expect(result.status).toBe("fresh_plan_required");
+    if (result.status === "fresh_plan_required") {
+      expect(result.reason).toContain("Non-contiguous");
+    }
+  });
+
+  it("completion: returns completed when all steps have been confirmed", () => {
+    const acct = account({ dataKeys: dataKeys(50) });
+    const steps = buildCleanupSteps(acct, DEST, PASSPHRASE);
+    expect(steps).toHaveLength(1);
+
+    let tracking = createPlanTracking(acct, DEST, steps);
+    tracking = recordStepConfirmation(tracking, 0);
+
+    const result = resumeCleanupPlan({
+      currentAccount: acct,
+      destination: DEST,
+      networkPassphrase: PASSPHRASE,
+      tracking,
+    });
+
+    expect(result.status).toBe("completed");
   });
 });
