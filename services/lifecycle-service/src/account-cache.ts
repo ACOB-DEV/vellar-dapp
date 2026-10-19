@@ -52,6 +52,17 @@ const DEFAULT_TTL_MS = 30_000;
  * this is what makes a merged-away source account correctly read as gone
  * once its cache entry is invalidated and re-fetched, rather than only
  * caching successful lookups.
+ *
+ * Expected invalidation behavior for mid-TTL on-chain closure (#532):
+ * When an account is closed on-chain (e.g. merged away by an external actor or
+ * concurrent process) while a cached entry for it is still within its TTL:
+ * 1. An in-TTL cached entry will continue to be served unless invalidated or expired.
+ * 2. To avoid serving a stale closed-account entry as if the account were still open,
+ *    callers must explicitly invalidate the entry via `invalidate(accountId)` (or
+ *    `invalidateAll()`), or wait for the TTL to expire.
+ * 3. Once invalidated or expired, the next `getAccount` call re-queries Horizon, receives
+ *    `undefined` (account not found), and caches that `undefined` entry so subsequent reads
+ *    accurately reflect that the account no longer exists on-chain.
  */
 export function createCachedAccountReader(
   reader: AccountReader,

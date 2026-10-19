@@ -2,6 +2,10 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   InMemoryDeployJobStore,
   MAX_RETRIES,
+  DEFAULT_MAX_ATTEMPTS,
+  DEFAULT_DLQ_THRESHOLD,
+  TerminalDeployError,
+  isTerminalFailure,
   computeBackoff,
   processDeploymentJob,
 } from "./policy-deploy-worker";
@@ -339,4 +343,155 @@ describe("Policy Deployment Worker", () => {
       expect(job?.last_error).toMatch(/not contract-enforced/);
     });
   });
+
+  describe("Failure classification: retryable vs terminal (#528)", () => {
+    it("classifies explicit TerminalDeployError as terminal", () => {
+      const err = new TerminalDeployError("Invalid policy template parameters");
+      expect(isTerminalFailure(err)).toBe(true);
+    });
+
+    it("classifies permanent failure patterns as terminal", () => {
+      expect(isTerminalFailure(new Error("Policy not found: 123"))).toBe(true);
+      expect(isTerminalFailure(new Error("Policy is not contract-enforced: abc"))).toBe(true);
+      expect(isTerminalFailure(new Error("Unknown policy type: custom_bad"))).toBe(true);
+      expect(isTerminalFailure(new Error("missing constructor args"))).toBe(true);
+      expect(isTerminalFailure(new Error("schema version 99 does not exist"))).toBe(true);
+      expect(isTerminalFailure(new Error("unattributable publisher: bad_pub"))).toBe(true);
+    });
+
+    it("classifies transient errors as retryable (not terminal)", () => {
+      expect(isTerminalFailure(new Error("Network connection timed out"))).toBe(false);
+      expect(isTerminalFailure(new Error("RPC 503 Service Unavailable"))).toBe(false);
+      expect(isTerminalFailure(new Error("Transaction simulation transient error"))).toBe(false);
+    });
+  });
+
+  describe("Max-attempts cap distinct from DLQ threshold (#528)", () => {
+    it("stops a retryable failure at a lower maxAttempts cap before reaching DLQ threshold", async () => {
+      // Store configured with maxAttempts: 2, dlqThreshold: 5
+      const customStore = new InMemoryDeployJobStore({ maxAttempts: 2, dlqThreshold: 5 });
+      const job = {
+        id: "capped-job-1",
+        policy_id: "policy-1",
+        wallet: "CWALLET",
+        network: "testnet" as const,
+        status: "pending" as const,
+        retry_count: 0,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      customStore.addJob(job);
+
+      // Attempt 1: retryable error -> should increment retry_count to 1 and stay pending
+      const error1 = new Error("Temporary network timeout");
+      await customStore.handleFailure("capped-job-1", error1, dlqStore, dlqMetrics);
+      const afterAttempt1 = await customStore.get("capped-job-1");
+      expect(afterAttempt1?.retry_count).toBe(1);
+      expect(afterAttempt1?.status).toBe("pending");
+
+      // Attempt 2: retryable error -> retry_count becomes 2, reaching maxAttempts (2) < dlqThreshold (5)
+      const error2 = new Error("Temporary network timeout again");
+      await customStore.handleFailure("capped-job-1", error2, dlqStore, dlqMetrics);
+      const afterAttempt2 = await customStore.get("capped-job-1");
+      expect(afterAttempt2?.retry_count).toBe(2);
+      expect(afterAttempt2?.status).toBe("dead");
+
+      // Moved to DLQ at 2 attempts, not 5
+      const dlqList = await dlqStore.list();
+      const dlqEntry = dlqList.entries.find((e) => e.original_job_id === "capped-job-1");
+      expect(dlqEntry).toBeDefined();
+      expect(dlqEntry?.failure_count).toBe(2);
+    });
+
+    it("respects per-job max_attempts over store default", async () => {
+      const customStore = new InMemoryDeployJobStore({ maxAttempts: 4, dlqThreshold: 5 });
+      const job = {
+        id: "per-job-1",
+        policy_id: "policy-1",
+        wallet: "CWALLET",
+        network: "testnet" as const,
+        status: "pending" as const,
+        retry_count: 0,
+        max_attempts: 1, // Stop on attempt 1
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      customStore.addJob(job);
+
+      await customStore.handleFailure("per-job-1", new Error("Transient error"), dlqStore, dlqMetrics);
+      const updated = await customStore.get("per-job-1");
+      expect(updated?.retry_count).toBe(1);
+      expect(updated?.status).toBe("dead");
+
+      const dlqList = await dlqStore.list();
+      const dlqEntry = dlqList.entries.find((e) => e.original_job_id === "per-job-1");
+      expect(dlqEntry).toBeDefined();
+      expect(dlqEntry?.failure_count).toBe(1);
+    });
+  });
+
+  describe("Fast terminal failure on attempt 1 (#528)", () => {
+    it("moves a terminal failure to DLQ immediately on the very first attempt without retrying", async () => {
+      const job = {
+        id: "terminal-job-1",
+        policy_id: "policy-1",
+        wallet: "CWALLET",
+        network: "testnet" as const,
+        status: "pending" as const,
+        retry_count: 0,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      jobStore.addJob(job);
+
+      // Fails on attempt 1 with a terminal error
+      const terminalErr = new TerminalDeployError("Permanently invalid template configuration");
+      await jobStore.handleFailure("terminal-job-1", terminalErr, dlqStore, dlqMetrics);
+
+      const updated = await jobStore.get("terminal-job-1");
+      // Must be dead immediately
+      expect(updated?.status).toBe("dead");
+      expect(updated?.retry_count).toBe(1);
+
+      // Must be in DLQ
+      const dlqList = await dlqStore.list();
+      const dlqEntry = dlqList.entries.find((e) => e.original_job_id === "terminal-job-1");
+      expect(dlqEntry).toBeDefined();
+      expect(dlqEntry?.failure_count).toBe(1);
+      expect(dlqEntry?.last_error).toContain("Permanently invalid template configuration");
+
+      // Audit event must record terminal: true
+      const auditTrail = await dlqStore.getAuditTrail(dlqEntry!.id);
+      expect(auditTrail[0]?.event_type).toBe("dlq_move");
+      expect(auditTrail[0]?.metadata.terminal).toBe(true);
+    });
+
+    it("processDeploymentJob moves terminal error to DLQ on attempt 1", async () => {
+      // Policy repo has no policy for this job -> triggers terminal Policy not found
+      const now = new Date().toISOString();
+      jobStore.addJob({
+        id: "missing-policy-job",
+        policy_id: "nonexistent-policy-id",
+        wallet: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+        network: "testnet",
+        status: "pending",
+        retry_count: 0,
+        created_at: now,
+        updated_at: now,
+      });
+
+      const processed = await processDeploymentJob(jobStore, policyRepo, deployer, dlqStore, dlqMetrics);
+      expect(processed).toBe(true);
+
+      const job = await jobStore.get("missing-policy-job");
+      expect(job?.status).toBe("dead");
+      expect(job?.retry_count).toBe(1);
+
+      const dlqList = await dlqStore.list();
+      const dlqEntry = dlqList.entries.find((e) => e.original_job_id === "missing-policy-job");
+      expect(dlqEntry).toBeDefined();
+      expect(dlqEntry?.last_error).toMatch(/Policy not found/);
+    });
+  });
 });
+

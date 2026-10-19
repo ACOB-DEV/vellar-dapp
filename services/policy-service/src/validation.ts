@@ -10,11 +10,17 @@
  */
 
 import { z } from "zod";
-import { validateDefinition as validatePolicyDefinition } from "./templates";
+import {
+  validateDefinition as validatePolicyDefinition,
+  validateDeployedPolicy as validatePolicyDeployed,
+} from "./templates";
 import type { PolicyRecord } from "./server";
 
 // Re-export for consumers
-export { validateDefinition as validatePolicyDefinition } from "./templates";
+export {
+  validateDefinition as validatePolicyDefinition,
+  validateDeployedPolicy,
+} from "./templates";
 
 /**
  * Validation result for a policy definition.
@@ -96,6 +102,9 @@ export function validatePolicyInstance(record: PolicyRecord): { valid: boolean; 
  * Wrapper to call templates.validateDefinition with type safety.
  * Validates a policy definition against the supported templates.
  */
-export function validateDefinition(definition: unknown): ValidationResult {
-  return validatePolicyDefinition(definition);
+export function validateDefinition(
+  definition: unknown,
+  schemaVersionOverride?: number,
+): ValidationResult {
+  return validatePolicyDefinition(definition, schemaVersionOverride);
 }

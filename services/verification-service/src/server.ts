@@ -325,6 +325,16 @@ export function buildServer(deps: VerificationServiceDeps = {}): FastifyInstance
   registerHealth(app, "verification-service");
   registerMetrics(app, "verification-service");
 
+  // In-flight per-contract tracking to coalesce/reject duplicate submissions
+  // arriving in the same event-loop tick before the DB insert completes.
+  const inFlightContracts = new Map<
+    string,
+    {
+      record?: VerificationRecordInternal;
+      promise: Promise<VerificationRecordInternal | undefined>;
+    }
+  >();
+
   // POST /verification/submit — record the submission and enqueue a build job.
   app.post("/verification/submit", async (request, reply) => {
     const parsed = submitBodySchema.safeParse(request.body);
@@ -332,6 +342,19 @@ export function buildServer(deps: VerificationServiceDeps = {}): FastifyInstance
       return reply.code(400).send({ error: "invalid_body", details: parsed.error.issues });
     }
     const input = parsed.data;
+
+    // Fast check: if another submission for this contract is in flight right now (e.g.
+    // same event-loop tick), reject or return the in-flight job's status.
+    const inFlight = inFlightContracts.get(input.contractId);
+    if (inFlight) {
+      const active = inFlight.record ?? (await inFlight.promise.catch(() => undefined));
+      return reply.code(409).send({
+        error: "verification_in_progress",
+        message: "A verification for this contract is already in progress.",
+        status: active?.status ?? "submitted",
+        record: active ? toPublic(active) : undefined,
+      });
+    }
 
     // Queue-depth cap (M7): this is the last unmetered unauthenticated write path
     // after the funding-path budgets, so the cap is a real control. Reject before
@@ -342,54 +365,72 @@ export function buildServer(deps: VerificationServiceDeps = {}): FastifyInstance
         message: "Verification queue is at capacity; try again later.",
       });
     }
+
     // Per-contractId dedup (M7): one active verification per contract, so a
     // single contractId can't be used to flood the shared queue with duplicates.
     if (await records.hasActiveForContract(input.contractId)) {
+      const history = await records.findByContract(input.contractId);
+      const active = history.find((r) => r.status === "submitted" || r.status === "building");
       return reply.code(409).send({
         error: "verification_in_progress",
         message: "A verification for this contract is already in progress.",
+        status: active?.status ?? "submitted",
+        record: active ? toPublic(active) : undefined,
       });
     }
 
-    const timestamp = now().toISOString();
-    const record: VerificationRecordInternal = {
-      id: randomUUID(),
-      contractId: input.contractId,
-      sourceType: input.sourceType,
-      repoUrl: input.repoUrl,
-      commitHash: input.commitHash,
-      sourceArchiveRef: input.sourceArchiveRef,
-      toolchainVersion: input.toolchainVersion,
-      buildFlags: input.buildFlags,
-      lockfileHash: input.lockfileHash,
-      traceId: request.traceContext?.traceId,
-      traceParentSpanId: request.traceContext?.spanId,
-      status: "submitted",
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
-    await records.insert(record);
+    let resolveRecord: ((r: VerificationRecordInternal) => void) | undefined;
+    const recordPromise = new Promise<VerificationRecordInternal>((resolve) => {
+      resolveRecord = resolve;
+    });
+    const holder = { promise: recordPromise, record: undefined as VerificationRecordInternal | undefined };
+    inFlightContracts.set(input.contractId, holder);
 
-    // Enqueue the build. If the queue rejects (worker/queue down) the submission
-    // still stands as "submitted" and can be retried — we don't lose the record.
     try {
-      await queue.enqueue({
-        recordId: record.id,
-        contractId: record.contractId,
-        sourceType: record.sourceType,
-        repoUrl: record.repoUrl,
-        commitHash: record.commitHash,
-        sourceArchiveRef: record.sourceArchiveRef,
-        toolchainVersion: record.toolchainVersion,
-        buildFlags: record.buildFlags,
-        traceId: record.traceId,
-        traceParentSpanId: record.traceParentSpanId,
-      });
-    } catch (err) {
-      request.log.error({ err, recordId: record.id }, "failed to enqueue build job");
-    }
+      const timestamp = now().toISOString();
+      const record: VerificationRecordInternal = {
+        id: randomUUID(),
+        contractId: input.contractId,
+        sourceType: input.sourceType,
+        repoUrl: input.repoUrl,
+        commitHash: input.commitHash,
+        sourceArchiveRef: input.sourceArchiveRef,
+        toolchainVersion: input.toolchainVersion,
+        buildFlags: input.buildFlags,
+        lockfileHash: input.lockfileHash,
+        traceId: request.traceContext?.traceId,
+        traceParentSpanId: request.traceContext?.spanId,
+        status: "submitted",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      await records.insert(record);
+      holder.record = record;
+      resolveRecord?.(record);
 
-    return reply.code(201).send({ record: toPublic(record) });
+      // Enqueue the build. If the queue rejects (worker/queue down) the submission
+      // still stands as "submitted" and can be retried — we don't lose the record.
+      try {
+        await queue.enqueue({
+          recordId: record.id,
+          contractId: record.contractId,
+          sourceType: record.sourceType,
+          repoUrl: record.repoUrl,
+          commitHash: record.commitHash,
+          sourceArchiveRef: record.sourceArchiveRef,
+          toolchainVersion: record.toolchainVersion,
+          buildFlags: record.buildFlags,
+          traceId: record.traceId,
+          traceParentSpanId: record.traceParentSpanId,
+        });
+      } catch (err) {
+        request.log.error({ err, recordId: record.id }, "failed to enqueue build job");
+      }
+
+      return reply.code(201).send({ record: toPublic(record) });
+    } finally {
+      inFlightContracts.delete(input.contractId);
+    }
   });
 
   // GET /verification/:contractId — full verification history for a contract.

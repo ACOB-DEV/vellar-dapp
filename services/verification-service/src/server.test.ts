@@ -234,6 +234,43 @@ describe("POST /verification/submit — queue controls (M7)", () => {
     expect(dup.json().error).toBe("verification_in_progress");
   });
 
+  it("Issue #534: rejects or coalesces duplicate submissions for the same contract id arriving in the same event-loop tick", async () => {
+    const records = createMemoryVerificationRepository();
+    const enqueuedJobs: BuildJob[] = [];
+    const queue: BuildJobQueue = {
+      async enqueue(job) {
+        enqueuedJobs.push(job);
+      },
+    };
+    app = buildServer({
+      records,
+      queue,
+      x402FacilitatorClient: fakeFacilitatorClient(),
+    });
+
+    // Fire two submissions simultaneously in the exact same event-loop tick
+    const [res1, res2] = await Promise.all([submit(app, C1), submit(app, C1)]);
+
+    const responses = [res1, res2];
+    const successRes = responses.find((r) => r.statusCode === 201);
+    const rejectedRes = responses.find((r) => r.statusCode === 409);
+
+    expect(successRes).toBeDefined();
+    expect(rejectedRes).toBeDefined();
+
+    // Verify rejected submission returns existing job status
+    const rejectedJson = rejectedRes!.json();
+    expect(rejectedJson.error).toBe("verification_in_progress");
+    expect(rejectedJson.status).toBe("submitted");
+    expect(rejectedJson.record).toBeDefined();
+    expect(rejectedJson.record.id).toBe(successRes!.json().record.id);
+
+    // Only 1 job was inserted into the repository and only 1 job enqueued
+    const allForContract = await records.findByContract(C1);
+    expect(allForContract).toHaveLength(1);
+    expect(enqueuedJobs).toHaveLength(1);
+  });
+
   it("allows resubmission of a contract whose prior run is terminal", async () => {
     const records = createMemoryVerificationRepository();
     app = buildServer({ records, x402FacilitatorClient: fakeFacilitatorClient() });

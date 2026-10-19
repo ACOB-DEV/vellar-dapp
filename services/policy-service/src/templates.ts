@@ -187,6 +187,7 @@ const positiveXlmAmount = z
 
 const base = z.object({
   version: z.literal("1"),
+  schemaVersion: z.number().int().min(1).default(1).optional(),
   owners: z
     .array(address)
     .min(1, "must have at least one owner")
@@ -246,6 +247,7 @@ export interface VerifiedRecipientConstructor {
 
 export interface PolicyTemplate {
   type: string;
+  schemaVersion: number;
   title: string;
   description: string;
   schema: z.ZodType;
@@ -284,6 +286,7 @@ const spendingLimitsSchema = z
 export const templates: PolicyTemplate[] = [
   {
     type: "single_owner",
+    schemaVersion: 1,
     title: "Single owner",
     description: "One key controls the account (the default smart-wallet state).",
     schema: base
@@ -299,6 +302,7 @@ export const templates: PolicyTemplate[] = [
   },
   {
     type: "multisig_threshold",
+    schemaVersion: 1,
     title: "Multisig threshold",
     description: "Require N of M owners to approve sensitive actions.",
     schema: base
@@ -321,6 +325,7 @@ export const templates: PolicyTemplate[] = [
   },
   {
     type: "spending_limit",
+    schemaVersion: 1,
     title: "Spending limit",
     description:
       "Cap total XLM a signer can move per fixed period, with optional on-chain safety rules (per-token single-transfer ceiling, token allowlist) for supported transfer patterns.",
@@ -335,6 +340,7 @@ export const templates: PolicyTemplate[] = [
   },
   {
     type: "token_spending_limit",
+    schemaVersion: 1,
     title: "Token budget (agent key)",
     description:
       "Cumulative allowance of ONE token per fixed period — the on-chain budget an agent session key is minted against. Transfers of any other token are rejected.",
@@ -348,6 +354,7 @@ export const templates: PolicyTemplate[] = [
   },
   {
     type: "contract_allowlist",
+    schemaVersion: 1,
     title: "Contract allowlist",
     description: "Restrict a signer to interacting only with approved contracts.",
     schema: base
@@ -363,6 +370,7 @@ export const templates: PolicyTemplate[] = [
   },
   {
     type: "verified_only",
+    schemaVersion: 1,
     title: "Verified provenance only",
     description:
       "Restrict a signer to contracts with verified source provenance — strict (any live attestation) or trusted publishers only. Verified means reproducible, attributable source; not audited or safe.",
@@ -376,6 +384,7 @@ export const templates: PolicyTemplate[] = [
   },
   {
     type: "timelock",
+    schemaVersion: 1,
     title: "Time-lock",
     description: "Delay sensitive admin actions by a configurable period.",
     schema: base
@@ -396,8 +405,13 @@ export const templates: PolicyTemplate[] = [
   },
 ];
 
-export function getTemplate(type: string): PolicyTemplate | undefined {
-  return templates.find((t) => t.type === type);
+export function getTemplate(type: string, schemaVersion?: number): PolicyTemplate | undefined {
+  if (schemaVersion !== undefined) {
+    return templates.find((t) => t.type === type && t.schemaVersion === schemaVersion);
+  }
+  const matching = templates.filter((t) => t.type === type);
+  if (matching.length === 0) return undefined;
+  return matching.slice().sort((a, b) => b.schemaVersion - a.schemaVersion)[0];
 }
 
 /**
@@ -488,11 +502,42 @@ export interface ValidationResult {
   errors: string[];
 }
 
-export function validateDefinition(definition: unknown): ValidationResult {
-  const typed = definition as { type?: unknown };
-  const template = typeof typed?.type === "string" ? getTemplate(typed.type) : undefined;
-  if (!template) {
+export function validateDefinition(
+  definition: unknown,
+  schemaVersionOverride?: number,
+): ValidationResult {
+  const typed = definition as { type?: unknown; schemaVersion?: unknown };
+  if (!typed || typeof typed !== "object") {
+    return { valid: false, errors: ["definition must be an object"] };
+  }
+  const typeStr = typeof typed.type === "string" ? typed.type : undefined;
+  if (!typeStr) {
     return { valid: false, errors: [`unknown policy type: ${String(typed?.type)}`] };
+  }
+
+  const requestedVersion =
+    schemaVersionOverride ??
+    (typeof typed.schemaVersion === "number" ? typed.schemaVersion : undefined);
+
+  if (requestedVersion !== undefined) {
+    const template = getTemplate(typeStr, requestedVersion);
+    if (!template) {
+      return {
+        valid: false,
+        errors: [`schema version ${requestedVersion} does not exist for policy type: ${typeStr}`],
+      };
+    }
+    const parsed = template.schema.safeParse(definition);
+    if (parsed.success) return { valid: true, errors: [] };
+    return {
+      valid: false,
+      errors: parsed.error.issues.map((i) => `${i.path.join(".") || "definition"}: ${i.message}`),
+    };
+  }
+
+  const template = getTemplate(typeStr);
+  if (!template) {
+    return { valid: false, errors: [`unknown policy type: ${typeStr}`] };
   }
   const parsed = template.schema.safeParse(definition);
   if (parsed.success) return { valid: true, errors: [] };
@@ -500,6 +545,15 @@ export function validateDefinition(definition: unknown): ValidationResult {
     valid: false,
     errors: parsed.error.issues.map((i) => `${i.path.join(".") || "definition"}: ${i.message}`),
   };
+}
+
+export function validateDeployedPolicy(record: {
+  definition: unknown;
+  schemaVersion?: number;
+}): ValidationResult {
+  const version =
+    record.schemaVersion ?? (record.definition as { schemaVersion?: number })?.schemaVersion;
+  return validateDefinition(record.definition, version);
 }
 
 /** Recursive key-sorted serialization — a replacer array would silently drop
@@ -523,9 +577,11 @@ export function policyHash(definition: PolicyDefinition): string {
 export interface GeneratedPolicy {
   definition: PolicyDefinition;
   policyHash: string;
+  schemaVersion?: number;
   /** Deployment manifest (idea.md §6.2): how this policy gets enforced. */
   manifest: {
     template: string;
+    schemaVersion?: number;
     enforcement: Enforcement;
     network: "testnet" | "mainnet";
   };
@@ -535,8 +591,15 @@ export function generatePolicy(
   definition: PolicyDefinition,
   network: "testnet" | "mainnet",
 ): GeneratedPolicy {
-  const template = getTemplate(definition.type);
-  if (!template) throw new Error(`unknown policy type: ${definition.type}`);
+  const schemaVersion = definition.schemaVersion ?? 1;
+  const template = getTemplate(definition.type, schemaVersion);
+  if (!template) {
+    throw new Error(
+      `unknown policy type: ${definition.type}${
+        definition.schemaVersion !== undefined ? ` (schemaVersion: ${definition.schemaVersion})` : ""
+      }`,
+    );
+  }
 
   // Spending limits deploy a policy contract instance; bake the per-user
   // constructor args (derived from THIS definition) into the manifest so the
@@ -557,9 +620,21 @@ export function generatePolicy(
     };
   }
 
+  const defWithVersion: PolicyDefinition = {
+    ...definition,
+    schemaVersion: template.schemaVersion,
+  };
+
   return {
-    definition,
-    policyHash: policyHash(definition),
-    manifest: { template: template.type, enforcement, network },
+    definition: defWithVersion,
+    policyHash: policyHash(defWithVersion),
+    schemaVersion: template.schemaVersion,
+    manifest: {
+      template: template.type,
+      schemaVersion: template.schemaVersion,
+      enforcement,
+      network,
+    },
   };
 }
+

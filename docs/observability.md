@@ -46,6 +46,7 @@ All custom application metrics adhere to `vela_<subsystem>_<metric_name>_<unit_o
 | `vela_wallet_tx_signed_total`                 | wallet-service    | tx signing completion rate        |
 | `vela_policy_deployed_total`                  | policy-service    | policy generation/deploy rate     |
 | `vela_policy_poison_messages_total`           | policy-service    | event queue poison message count  |
+| `vela_policy_event_queue_depth`               | policy-service    | event queue backlog depth         |
 | `vela_worker_verification_total`              | worker-service    | verification outcomes             |
 | `vela_worker_verification_turnaround_seconds` | worker-service    | verification turnaround (hist.)   |
 | `vela_lifecycle_cleanup_completed_total`      | lifecycle-service | cleanup completion rate           |

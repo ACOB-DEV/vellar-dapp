@@ -202,6 +202,14 @@ const workerQueueDepth = new Gauge({
 });
 assertMetricName("vela_worker_queue_depth");
 
+const policyEventQueueDepth = new Gauge({
+  name: "vela_policy_event_queue_depth",
+  help: "Current backlog depth (number of pending messages) in policy-service event queue",
+  labelNames: ["service"] as const,
+  registers: [registry],
+});
+assertMetricName("vela_policy_event_queue_depth");
+
 // Referenced by domainMetrics/metrics.test.ts but not previously defined
 // anywhere in this file (a real pre-existing bug — importing this module
 // throws `workerProcessingLagSeconds is not defined` at module load time).
@@ -275,6 +283,8 @@ export const domainMetrics = {
   verificationTurnaround: workerVerificationTurnaround,
   workerQueueDepth,
   workerProcessingLagSeconds,
+  policyEventQueueDepth,
+  eventQueueDepth: policyEventQueueDepth,
   workerVerificationRetry,
   verificationRetry: workerVerificationRetry,
   workerVerificationDeadLetter,
