@@ -36,7 +36,12 @@ export class OriginPermissionCache<Value> {
     this.entries.set(origin, { value, expiresAt: this.now() + this.ttlMs });
   }
 
-  delete(origin: string): boolean {
+  // Call this when the extension revokes a permission so stale reads cannot survive the TTL.
+  invalidate(origin: string): boolean {
     return this.entries.delete(origin);
+  }
+
+  delete(origin: string): boolean {
+    return this.invalidate(origin);
   }
 }

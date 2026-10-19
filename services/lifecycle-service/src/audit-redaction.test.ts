@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   redactAuditEvent,
+  redactNested,
   hashForRedaction,
   generateRedactionSalt,
   type AuditEvent,
@@ -501,6 +502,130 @@ describe("audit-redaction", () => {
         expect(redactedStr).toContain("balance");
         expect(redactedStr).toContain("trustline");
         expect(redactedStr).toContain("data");
+      });
+    });
+
+    describe("Issue #533: Nested redaction, sponsor secret keys, error causes, and circular references", () => {
+      // 56-char Stellar secret key starting with S
+      const SPONSOR_SECRET_KEY = "SBYV4L7OGVGB45PDR3P7W3RFL6IOMTXCQN6N23TY6P72F7Y5K6X6YXYZ";
+
+      it("redacts sponsor secret key nested several levels deep in an error cause chain", () => {
+        // Build a 3-level cause chain with secret key at the bottom
+        const rootCause = new Error(`Connection failed with sponsor key ${SPONSOR_SECRET_KEY}`);
+        const intermediateError = new Error("Transport failed while relaying transaction", {
+          cause: rootCause,
+        });
+        const topError = new Error("Account merge failed due to relayer failure", {
+          cause: intermediateError,
+        });
+
+        const event: AuditEvent = {
+          type: "lifecycle.action_failed",
+          at: "2026-08-29T14:30:00Z",
+          data: {
+            operation: "merge",
+            error: topError,
+          },
+        };
+
+        const redacted = redactAuditEvent(event, salt);
+        const redactedStr = JSON.stringify(redacted);
+
+        // Sponsor secret key must NEVER survive redaction anywhere in the event string
+        expect(redactedStr).not.toContain(SPONSOR_SECRET_KEY);
+        expect(redactedStr).toContain("[REDACTED_SECRET_KEY]");
+
+        // Verify cause chain is preserved and walked
+        const errData = redacted.data.error as any;
+        expect(errData).toBeDefined();
+        expect(errData.name).toBe("Error");
+        expect(errData.message).toContain("Account merge failed");
+        expect(errData.cause).toBeDefined();
+        expect(errData.cause.message).toContain("Transport failed");
+        expect(errData.cause.cause).toBeDefined();
+        expect(errData.cause.cause.message).toBe("Connection failed with sponsor key [REDACTED_SECRET_KEY]");
+      });
+
+      it("redacts sponsor secret keys stored in error custom properties", () => {
+        const error = new Error("Sponsor fee failure");
+        (error as any).sponsorSecretKey = SPONSOR_SECRET_KEY;
+        (error as any).details = {
+          rawSeed: SPONSOR_SECRET_KEY,
+        };
+
+        const event: AuditEvent = {
+          type: "lifecycle.error",
+          at: "2026-08-29T14:30:00Z",
+          data: {
+            error,
+          },
+        };
+
+        const redacted = redactAuditEvent(event, salt);
+        const redactedStr = JSON.stringify(redacted);
+
+        expect(redactedStr).not.toContain(SPONSOR_SECRET_KEY);
+        const errData = redacted.data.error as any;
+        expect(errData.sponsorSecretKey).toBe("[REDACTED_SECRET_KEY]");
+        expect(errData.details.rawSeed).toBe("[REDACTED_SECRET_KEY]");
+      });
+
+      it("recursively walks deeply nested arbitrary structures", () => {
+        const nestedData = {
+          level1: {
+            level2: {
+              level3: {
+                level4: {
+                  sponsorKey: SPONSOR_SECRET_KEY,
+                  normalField: "hello",
+                  errorObj: new Error(`nested error with ${SPONSOR_SECRET_KEY}`),
+                },
+              },
+            },
+          },
+        };
+
+        const redacted = redactNested(nestedData, salt) as any;
+        const str = JSON.stringify(redacted);
+
+        expect(str).not.toContain(SPONSOR_SECRET_KEY);
+        expect(redacted.level1.level2.level3.level4.sponsorKey).toBe("[REDACTED_SECRET_KEY]");
+        expect(redacted.level1.level2.level3.level4.normalField).toBe("hello");
+        expect(redacted.level1.level2.level3.level4.errorObj.message).toBe("nested error with [REDACTED_SECRET_KEY]");
+      });
+
+      it("handles circular-reference objects without infinite loops", () => {
+        const circularObj: any = {
+          name: "circular-test",
+          secret: SPONSOR_SECRET_KEY,
+        };
+        circularObj.self = circularObj;
+        circularObj.nested = { parent: circularObj };
+
+        // Must not throw or stack overflow
+        const redacted = redactNested(circularObj, salt) as any;
+        const str = JSON.stringify(redacted);
+
+        expect(str).not.toContain(SPONSOR_SECRET_KEY);
+        expect(redacted.name).toBe("circular-test");
+        expect(redacted.secret).toBe("[REDACTED_SECRET_KEY]");
+        expect(redacted.self).toBe("[Circular]");
+        expect(redacted.nested.parent).toBe("[Circular]");
+      });
+
+      it("handles circular cause chains on errors without infinite loops", () => {
+        const err1 = new Error("outer error");
+        const err2 = new Error(`inner error ${SPONSOR_SECRET_KEY}`);
+        (err1 as any).cause = err2;
+        (err2 as any).cause = err1; // circular cause
+
+        const redacted = redactNested(err1, salt) as any;
+        const str = JSON.stringify(redacted);
+
+        expect(str).not.toContain(SPONSOR_SECRET_KEY);
+        expect(redacted.name).toBe("Error");
+        expect(redacted.cause.name).toBe("Error");
+        expect(redacted.cause.cause).toBe("[Circular]");
       });
     });
   });

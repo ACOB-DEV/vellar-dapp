@@ -767,16 +767,7 @@ describe("sensitive wallet action audit logging (#313)", () => {
     });
     expect(rotateRes.statusCode).toBe(200);
 
-    // 4. threshold.updated
-    const thresholdRes = await server.inject({
-      method: "POST",
-      url: "/wallet/threshold/update",
-      headers: bearer(createSessionId),
-      payload: { threshold: 2 },
-    });
-    expect(thresholdRes.statusCode).toBe(200);
-
-    // 5. signer.added & signer.removed
+    // 4. signer.added & signer.removed
     const addSignerRes = await server.inject({
       method: "POST",
       url: "/wallet/signer/manage",
@@ -784,6 +775,15 @@ describe("sensitive wallet action audit logging (#313)", () => {
       payload: { action: "add", signerKey: "GNEWKEY", weight: 1 },
     });
     expect(addSignerRes.statusCode).toBe(200);
+
+    // 5. threshold.updated (now 2 signers on the account, so threshold 2 is valid)
+    const thresholdRes = await server.inject({
+      method: "POST",
+      url: "/wallet/threshold/update",
+      headers: bearer(createSessionId),
+      payload: { threshold: 2 },
+    });
+    expect(thresholdRes.statusCode).toBe(200);
 
     const removeSignerRes = await server.inject({
       method: "POST",
@@ -1066,6 +1066,159 @@ describe("GET /wallet/audit-logs - actor-based filtering (issue #512)", () => {
   });
 });
 
+describe("POST /wallet/threshold/update (issue #508)", () => {
+  const bearer = (id: string) => ({ authorization: `Bearer ${id}` });
+
+  it("accepts threshold equal to signer count (boundary condition)", async () => {
+    const audit = createMemoryAuditLog();
+    const server = build(workingSubmitter(), audit);
+    const { createSessionId } = await createAndConnect(server);
+
+    // Initial signer count is 1. Threshold = 1 is valid (1 == 1).
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/threshold/update",
+      headers: bearer(createSessionId),
+      payload: { threshold: 1 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ status: "threshold_updated", threshold: 1 });
+  });
+
+  it("accepts threshold less than signer count", async () => {
+    const audit = createMemoryAuditLog();
+    const server = build(workingSubmitter(), audit);
+    const { createSessionId } = await createAndConnect(server);
+
+    // Add 2 signers (total 3: 1 initial + 2 added)
+    await server.inject({
+      method: "POST",
+      url: "/wallet/signer/manage",
+      headers: bearer(createSessionId),
+      payload: { action: "add", signerKey: "GSIGNER1" },
+    });
+    await server.inject({
+      method: "POST",
+      url: "/wallet/signer/manage",
+      headers: bearer(createSessionId),
+      payload: { action: "add", signerKey: "GSIGNER2" },
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/threshold/update",
+      headers: bearer(createSessionId),
+      payload: { threshold: 2 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ status: "threshold_updated", threshold: 2 });
+  });
+
+  it("accepts explicit signerCount and threshold <= signerCount", async () => {
+    const audit = createMemoryAuditLog();
+    const server = build(workingSubmitter(), audit);
+    const { createSessionId } = await createAndConnect(server);
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/threshold/update",
+      headers: bearer(createSessionId),
+      payload: { threshold: 3, signerCount: 3 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ status: "threshold_updated", threshold: 3 });
+  });
+
+  it("rejects threshold exceeding signer count with clear 400 error", async () => {
+    const audit = createMemoryAuditLog();
+    const server = build(workingSubmitter(), audit);
+    const { createSessionId } = await createAndConnect(server);
+
+    // Default account has 1 signer, requested threshold is 2
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/threshold/update",
+      headers: bearer(createSessionId),
+      payload: { threshold: 2 },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({
+      error: "threshold_exceeds_signers",
+      message: "Threshold 2 exceeds signer count 1",
+      threshold: 2,
+      signerCount: 1,
+    });
+  });
+
+  it("rejects threshold exceeding explicit signerCount", async () => {
+    const audit = createMemoryAuditLog();
+    const server = build(workingSubmitter(), audit);
+    const { createSessionId } = await createAndConnect(server);
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/threshold/update",
+      headers: bearer(createSessionId),
+      payload: { threshold: 5, signerCount: 3 },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({
+      error: "threshold_exceeds_signers",
+      message: "Threshold 5 exceeds signer count 3",
+      threshold: 5,
+      signerCount: 3,
+    });
+  });
+
+  it("rejects threshold of zero with invalid_threshold error", async () => {
+    const audit = createMemoryAuditLog();
+    const server = build(workingSubmitter(), audit);
+    const { createSessionId } = await createAndConnect(server);
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/threshold/update",
+      headers: bearer(createSessionId),
+      payload: { threshold: 0 },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({
+      error: "invalid_threshold",
+      message: "Threshold must be greater than zero",
+      threshold: 0,
+    });
+  });
+
+  it("rejects negative threshold with invalid_threshold error", async () => {
+    const audit = createMemoryAuditLog();
+    const server = build(workingSubmitter(), audit);
+    const { createSessionId } = await createAndConnect(server);
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/threshold/update",
+      headers: bearer(createSessionId),
+      payload: { threshold: -1 },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({
+      error: "invalid_threshold",
+      message: "Threshold must be greater than zero",
+      threshold: -1,
+    });
+  });
+
+  it("rejects missing bearer with 401", async () => {
+    const server = build(workingSubmitter());
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/threshold/update",
+      payload: { threshold: 1 },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
 describe("GET /wallet/transactions (issue #256)", () => {
   const bearer = (id: string) => ({ authorization: `Bearer ${id}` });
   const PASSPHRASE = "Test SDF Network ; September 2015";
@@ -1287,6 +1440,210 @@ describe("GET /wallet/transactions (issue #256)", () => {
     });
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toBe("invalid_cursor");
+  });
+});
+
+describe("POST /wallet/submit idempotency via signed XDR hash (#515)", () => {
+  it("returns the original submission result for identical signed envelope without resubmitting", async () => {
+    const submitter = { submit: vi.fn().mockResolvedValue({ hash: "txhash-dedup-1" }) };
+    const server = buildServer({ submitter });
+
+    const payload = { signedXdr: "envelope-xdr-identical-123", network: "testnet" };
+
+    const first = await server.inject({ method: "POST", url: "/wallet/submit", payload });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toEqual({ hash: "txhash-dedup-1" });
+    expect(submitter.submit).toHaveBeenCalledTimes(1);
+
+    // Resubmit identical signed XDR envelope
+    const second = await server.inject({ method: "POST", url: "/wallet/submit", payload });
+    expect(second.statusCode).toBe(200);
+    expect(second.json()).toEqual({ hash: "txhash-dedup-1" });
+    expect(submitter.submit).toHaveBeenCalledTimes(1); // not called again!
+  });
+
+  it("does not deduplicate two different signed envelopes for the same logical payment", async () => {
+    const submitter = {
+      submit: vi
+        .fn()
+        .mockResolvedValueOnce({ hash: "txhash-envelope-1" })
+        .mockResolvedValueOnce({ hash: "txhash-envelope-2" }),
+    };
+    const server = buildServer({ submitter });
+
+    const payload1 = { signedXdr: "envelope-xdr-version-1", network: "testnet" };
+    const payload2 = { signedXdr: "envelope-xdr-version-2", network: "testnet" };
+
+    const first = await server.inject({ method: "POST", url: "/wallet/submit", payload: payload1 });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toEqual({ hash: "txhash-envelope-1" });
+
+    const second = await server.inject({
+      method: "POST",
+      url: "/wallet/submit",
+      payload: payload2,
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json()).toEqual({ hash: "txhash-envelope-2" });
+    expect(submitter.submit).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates balance cache for affected wallets on successful submit (#520)", async () => {
+    const cache = {
+      get: vi.fn().mockResolvedValue({ hit: false }),
+      set: vi.fn().mockResolvedValue(undefined),
+      delete: vi.fn().mockResolvedValue(undefined),
+      invalidateBalance: vi.fn().mockResolvedValue(undefined),
+    };
+    const submitter = { submit: vi.fn().mockResolvedValue({ hash: "txhash-cache-inval" }) };
+    const server = buildServer({ submitter, cache });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/submit",
+      payload: { signedXdr: "test-signed-xdr-balance-inval", network: "testnet" },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+});
+
+describe("POST /wallet/jobs and job status lookup (#516)", () => {
+  it("enqueues a job with queued status and exposes it via GET /wallet/jobs/:recordId", async () => {
+    const server = build(workingSubmitter());
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/jobs",
+      payload: {
+        recordId: "job-rec-1",
+        contractId: "CCONTRACT",
+      },
+    });
+
+    expect(res.statusCode).toBe(202);
+    expect(res.json().enqueued).toBe(true);
+    expect(res.json().status).toBe("queued");
+    expect(res.json().recordId).toBe("job-rec-1");
+
+    // Lookup job
+    const lookup = await server.inject({
+      url: "/wallet/jobs/job-rec-1",
+    });
+    expect(lookup.statusCode).toBe(200);
+    expect(lookup.json()).toMatchObject({
+      recordId: "job-rec-1",
+      contractId: "CCONTRACT",
+      status: "queued",
+    });
+  });
+
+  it("exposes building status and transitions to stuck purely due to elapsed time", async () => {
+    let clock = new Date("2026-08-01T12:00:00.000Z");
+    const server = buildServer({
+      submitter: workingSubmitter(),
+      now: () => clock,
+      jobStuckThresholdMs: 300_000, // 5 minutes
+    });
+
+    await server.inject({
+      method: "POST",
+      url: "/wallet/jobs",
+      payload: { recordId: "job-rec-building", contractId: "CCONTRACT" },
+    });
+
+    // Flip to building at 12:01
+    clock = new Date("2026-08-01T12:01:00.000Z");
+    const patch = await server.inject({
+      method: "PATCH",
+      url: "/wallet/jobs/job-rec-building",
+      payload: { status: "building" },
+    });
+    expect(patch.statusCode).toBe(200);
+    expect(patch.json().status).toBe("building");
+
+    // 2 minutes later: still building
+    clock = new Date("2026-08-01T12:03:00.000Z");
+    const lookupBuilding = await server.inject({ url: "/wallet/jobs/job-rec-building" });
+    expect(lookupBuilding.statusCode).toBe(200);
+    expect(lookupBuilding.json().status).toBe("building");
+
+    // 6 minutes after transition: exceeded 5 min threshold without any event -> status is stuck!
+    clock = new Date("2026-08-01T12:07:01.000Z");
+    const lookupStuck = await server.inject({ url: "/wallet/jobs/job-rec-building" });
+    expect(lookupStuck.statusCode).toBe(200);
+    expect(lookupStuck.json().status).toBe("stuck");
+  });
+
+  it("returns 404 for unknown job recordId", async () => {
+    const server = build(workingSubmitter());
+    const res = await server.inject({ url: "/wallet/jobs/unknown-job-id" });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toBe("job_not_found");
+  });
+});
+
+describe("GET /wallet/session response shape for contract id (#517)", () => {
+  it("asserts exact 401 response shape when no session exists", async () => {
+    const server = build(workingSubmitter());
+
+    // Without bearer header
+    const noHeader = await server.inject({ url: "/wallet/session" });
+    expect(noHeader.statusCode).toBe(401);
+    expect(noHeader.json()).toEqual({ error: "unauthorized" });
+
+    // With unknown bearer
+    const unknownBearer = await server.inject({
+      url: "/wallet/session",
+      headers: { authorization: "Bearer bogus-token-12345" },
+    });
+    expect(unknownBearer.statusCode).toBe(401);
+    expect(unknownBearer.json()).toEqual({ error: "unauthorized" });
+  });
+
+  it("asserts exact 401 response shape when session exists for a different contractId", async () => {
+    const server = build(workingSubmitter());
+    const { createSessionId } = await createAndConnect(server);
+
+    // Query for a contractId that differs from the session's contractId
+    const mismatch = await server.inject({
+      url: "/wallet/session?contractId=CDIFFERENT_CONTRACT",
+      headers: { authorization: `Bearer ${createSessionId}` },
+    });
+    expect(mismatch.statusCode).toBe(401);
+    expect(mismatch.json()).toEqual({ error: "unauthorized" });
+
+    // Matching contractId returns 200 with session record shape
+    const match = await server.inject({
+      url: "/wallet/session?contractId=CCONTRACT",
+      headers: { authorization: `Bearer ${createSessionId}` },
+    });
+    expect(match.statusCode).toBe(200);
+    expect(match.json()).toMatchObject({
+      id: createSessionId,
+      contractId: "CCONTRACT",
+      network: "testnet",
+    });
+  });
+
+  it("asserts exact 401 response shape when session has expired", async () => {
+    let clock = new Date("2026-08-01T00:00:00.000Z");
+    const server = buildServer({ submitter: workingSubmitter(), now: () => clock });
+
+    const create = await server.inject({
+      method: "POST",
+      url: "/wallet/create",
+      payload: createBody,
+    });
+    const sessionId = create.json().sessionId as string;
+
+    // Advance clock past 7 days (SESSION_TTL_MS)
+    clock = new Date("2026-08-10T00:00:01.000Z");
+    const expiredRes = await server.inject({
+      url: "/wallet/session?contractId=CCONTRACT",
+      headers: { authorization: `Bearer ${sessionId}` },
+    });
+    expect(expiredRes.statusCode).toBe(401);
+    expect(expiredRes.json()).toEqual({ error: "unauthorized" });
   });
 });
 

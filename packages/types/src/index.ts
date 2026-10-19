@@ -40,6 +40,7 @@ export interface SignTransactionInput {
 
 export interface PolicyDefinition {
   version: string;
+  schemaVersion?: number;
   type: string;
   owners: string[];
   threshold?: number;

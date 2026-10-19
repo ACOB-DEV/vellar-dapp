@@ -61,6 +61,102 @@ function extractBlockerTypes(blockers: unknown[]): string[] {
   return Array.from(types).sort();
 }
 
+const STELLAR_SECRET_REGEX = /\bS[A-Z0-9]{55}\b/g;
+
+function isSensitiveKey(key: string): boolean {
+  return /secret|private_?key|sponsor.*key|seed/i.test(key);
+}
+
+function redactString(str: string): string {
+  return str.replace(STELLAR_SECRET_REGEX, "[REDACTED_SECRET_KEY]");
+}
+
+/**
+ * Recursively walks nested structures, error cause chains, arrays, and objects,
+ * redacting Stellar secret keys and sensitive field values.
+ * Uses a WeakSet to detect and prevent infinite loops on circular references.
+ */
+export function redactNested(
+  value: unknown,
+  salt?: string,
+  seen: WeakSet<object> = new WeakSet(),
+): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    return redactString(value);
+  }
+
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    typeof value === "bigint"
+  ) {
+    return value;
+  }
+
+  if (typeof value === "symbol") {
+    return value.toString();
+  }
+
+  if (typeof value === "function") {
+    return "[Function]";
+  }
+
+  if (typeof value === "object") {
+    if (seen.has(value)) {
+      return "[Circular]";
+    }
+    seen.add(value);
+
+    // Error handling (including cause chain)
+    if (value instanceof Error || ("message" in value && "name" in value)) {
+      const err = value as Error & { cause?: unknown; [key: string]: unknown };
+      const result: Record<string, unknown> = {
+        name: err.name,
+        message: typeof err.message === "string" ? redactString(err.message) : err.message,
+      };
+
+      if (typeof err.stack === "string") {
+        result.stack = redactString(err.stack);
+      }
+
+      if ("cause" in err && err.cause !== undefined) {
+        result.cause = redactNested(err.cause, salt, seen);
+      }
+
+      for (const prop of Object.getOwnPropertyNames(err)) {
+        if (["name", "message", "stack", "cause"].includes(prop)) continue;
+        if (isSensitiveKey(prop)) {
+          result[prop] = "[REDACTED_SECRET_KEY]";
+        } else {
+          result[prop] = redactNested(err[prop], salt, seen);
+        }
+      }
+
+      return result;
+    }
+
+    if (Array.isArray(value)) {
+      return value.map((item) => redactNested(item, salt, seen));
+    }
+
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (isSensitiveKey(k)) {
+        result[k] = "[REDACTED_SECRET_KEY]";
+      } else {
+        result[k] = redactNested(v, salt, seen);
+      }
+    }
+    return result;
+  }
+
+  return value;
+}
+
 /**
  * Redacts PII from a lifecycle-service audit event before persistence.
  *
@@ -144,6 +240,7 @@ export function redactAuditEvent(event: AuditEvent, salt: string): AuditEvent {
 
   // Redact based on endpoint type
   const eventType = event.type;
+  const seen = new WeakSet<object>();
 
   if (eventType === "lifecycle.inspect_requested" || eventType === "lifecycle.account_inspected") {
     // POST /lifecycle/inspect returns { account: HorizonAccount }
@@ -178,24 +275,26 @@ export function redactAuditEvent(event: AuditEvent, salt: string): AuditEvent {
     }
   } else {
     // Unknown event type: apply conservative redaction
-    // Only preserve top-level primitive fields that are unlikely to contain PII
+    // Avoid common PII field names, but walk nested structures and scrub sensitive data
     for (const [key, value] of Object.entries(event.data)) {
       if (
-        typeof value === "string" ||
-        typeof value === "number" ||
-        typeof value === "boolean" ||
-        value === null
+        ["accountId", "destination", "account", "dataKeys", "offers", "description"].includes(
+          key,
+        )
       ) {
-        // Avoid common PII field names
-        if (
-          !["accountId", "destination", "account", "dataKeys", "offers", "description"].includes(
-            key,
-          )
-        ) {
-          redacted.data[key] = value;
-        }
+        continue;
+      }
+      if (isSensitiveKey(key)) {
+        redacted.data[key] = "[REDACTED_SECRET_KEY]";
+      } else {
+        redacted.data[key] = redactNested(value, salt, seen);
       }
     }
+  }
+
+  // If an error is attached to any event data, ensure it is safely redacted and retained
+  if (event.data.error !== undefined && redacted.data.error === undefined) {
+    redacted.data.error = redactNested(event.data.error, salt, seen);
   }
 
   return redacted;

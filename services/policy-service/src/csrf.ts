@@ -35,8 +35,12 @@ export function verifyCsrfToken(
   secret: string,
   opts: { nowMs?: number; ttlMs?: number } = {},
 ): CsrfVerificationResult {
-  if (!token || typeof token !== "string" || token.trim().length === 0) {
+  if (token === undefined || token === null) {
     return { valid: false, reason: "missing" };
+  }
+
+  if (typeof token !== "string" || token.trim().length === 0) {
+    return { valid: false, reason: "malformed" };
   }
 
   const parts = token.trim().split(".");
@@ -85,7 +89,7 @@ export function createCsrfPreHandler(options: CsrfOptions) {
       (request.headers["x-csrf-token"] as string | undefined) ??
       (request.headers["csrf-token"] as string | undefined);
 
-    if (!rawToken) {
+    if (rawToken === undefined) {
       return reply.code(403).send({
         error: "csrf_token_missing",
         message: "CSRF token is required for state-changing admin routes",

@@ -166,3 +166,208 @@ export function buildMergeStep(
     tx,
   );
 }
+
+/** Per-step confirmation state in a multi-step cleanup plan. */
+export interface StepConfirmation {
+  stepIndex: number;
+  hash: string;
+  confirmed: boolean;
+  confirmedAt?: string;
+}
+
+/** Full tracking state for a multi-step cleanup plan. */
+export interface MultiStepPlanTracking {
+  planId: string;
+  accountId: string;
+  destination: string;
+  totalSteps: number;
+  steps: StepConfirmation[];
+  originalSteps: CleanupStep[];
+  expectedState: {
+    sequence: string;
+    balances: Array<{
+      assetType: string;
+      assetCode?: string;
+      assetIssuer?: string;
+      balance: string;
+    }>;
+    dataKeys: string[];
+    openOffers: number;
+  };
+}
+
+/** Creates a tracking record for a multi-step plan. */
+export function createPlanTracking(
+  account: HorizonAccount,
+  destination: string,
+  steps: CleanupStep[],
+): MultiStepPlanTracking {
+  return {
+    planId: `plan_${account.accountId}_${Date.now()}`,
+    accountId: account.accountId,
+    destination,
+    totalSteps: steps.length,
+    steps: steps.map((s, idx) => ({
+      stepIndex: idx,
+      hash: s.hash,
+      confirmed: false,
+    })),
+    originalSteps: steps,
+    expectedState: {
+      sequence: account.sequence,
+      balances: account.balances.map((b) => ({ ...b })),
+      dataKeys: [...account.dataKeys],
+      openOffers: account.openOffers,
+    },
+  };
+}
+
+/** Records a step as confirmed by either step index or transaction hash. */
+export function recordStepConfirmation(
+  tracking: MultiStepPlanTracking,
+  confirmedStepIndexOrHash: number | string,
+): MultiStepPlanTracking {
+  return {
+    ...tracking,
+    steps: tracking.steps.map((s) => {
+      if (
+        s.stepIndex === confirmedStepIndexOrHash ||
+        s.hash === confirmedStepIndexOrHash
+      ) {
+        return {
+          ...s,
+          confirmed: true,
+          confirmedAt: s.confirmedAt ?? new Date().toISOString(),
+        };
+      }
+      return s;
+    }),
+  };
+}
+
+export interface ResumePlanOptions {
+  currentAccount: HorizonAccount;
+  destination: string;
+  networkPassphrase: string;
+  tracking: MultiStepPlanTracking;
+}
+
+export type ResumePlanResult =
+  | {
+      status: "resumed";
+      resumedFromStep: number;
+      remainingSteps: CleanupStep[];
+      completedStepCount: number;
+      totalSteps: number;
+    }
+  | {
+      status: "completed";
+      message: string;
+    }
+  | {
+      status: "fresh_plan_required";
+      reason: string;
+      details?: Record<string, unknown>;
+    };
+
+/**
+ * Resumes a partially completed multi-step cleanup plan from the last confirmed step.
+ *
+ * Verifies that confirmed steps executed in sequential order and validates that the on-chain
+ * state has not diverged from expectations (e.g. unexpected trustline balance changes or new offers).
+ * If on-chain state has changed since planning, safely refuses to resume and requires a fresh plan.
+ */
+export function resumeCleanupPlan(options: ResumePlanOptions): ResumePlanResult {
+  const { currentAccount, destination, networkPassphrase, tracking } = options;
+
+  if (currentAccount.accountId !== tracking.accountId) {
+    return {
+      status: "fresh_plan_required",
+      reason: `Account mismatch: expected ${tracking.accountId} but received ${currentAccount.accountId}`,
+    };
+  }
+
+  // Find confirmed step indices
+  const confirmedIndices = tracking.steps
+    .filter((s) => s.confirmed)
+    .map((s) => s.stepIndex)
+    .sort((a, b) => a - b);
+
+  if (confirmedIndices.length === tracking.totalSteps) {
+    return {
+      status: "completed",
+      message: "All steps in the cleanup plan have already been confirmed.",
+    };
+  }
+
+  // Check that confirmed steps are contiguous starting from 0 (Stellar sequences require order)
+  for (let i = 0; i < confirmedIndices.length; i++) {
+    if (confirmedIndices[i] !== i) {
+      return {
+        status: "fresh_plan_required",
+        reason: `Non-contiguous step confirmation: step ${i} is unconfirmed but subsequent step ${confirmedIndices[i]} is confirmed`,
+      };
+    }
+  }
+
+  const resumedFromStep = confirmedIndices.length;
+
+  // Validate on-chain state against initial expected state.
+  // Check 1: Check for unexpected new balances or changed balances on remaining assets
+  const originalBalanceMap = new Map<string, string>();
+  for (const b of tracking.expectedState.balances) {
+    if (b.assetType === "native") continue;
+    const key = `${b.assetCode}:${b.assetIssuer}`;
+    originalBalanceMap.set(key, b.balance);
+  }
+
+  const currentBalanceMap = new Map<string, string>();
+  for (const b of currentAccount.balances) {
+    if (b.assetType === "native") continue;
+    const key = `${b.assetCode}:${b.assetIssuer}`;
+    currentBalanceMap.set(key, b.balance);
+  }
+
+  // Any brand new trustline balance that was never part of original plan requires a fresh plan
+  for (const [key, curBal] of currentBalanceMap.entries()) {
+    if (!originalBalanceMap.has(key)) {
+      return {
+        status: "fresh_plan_required",
+        reason: `On-chain state changed: unexpected new asset trustline balance for ${key} (${curBal})`,
+        details: { asset: key, currentBalance: curBal },
+      };
+    }
+  }
+
+  // Check if an existing trustline balance increased or changed unexpectedly
+  for (const [key, curBal] of currentBalanceMap.entries()) {
+    const origBal = originalBalanceMap.get(key);
+    if (origBal !== undefined && curBal !== origBal && curBal !== "0") {
+      // If balance changed to something other than being emptied, it requires a fresh plan
+      return {
+        status: "fresh_plan_required",
+        reason: `On-chain state changed: trustline balance for ${key} changed from ${origBal} to ${curBal}`,
+        details: { asset: key, previousBalance: origBal, currentBalance: curBal },
+      };
+    }
+  }
+
+  // Check 2: Check if new offers appeared that were not part of original plan
+  if (currentAccount.openOffers > tracking.expectedState.openOffers) {
+    return {
+      status: "fresh_plan_required",
+      reason: `On-chain state changed: open offers increased from ${tracking.expectedState.openOffers} to ${currentAccount.openOffers}`,
+    };
+  }
+
+  // Rebuild remaining steps from currentAccount state
+  const remainingSteps = buildCleanupSteps(currentAccount, destination, networkPassphrase);
+
+  return {
+    status: "resumed",
+    resumedFromStep,
+    remainingSteps,
+    completedStepCount: resumedFromStep,
+    totalSteps: tracking.totalSteps,
+  };
+}

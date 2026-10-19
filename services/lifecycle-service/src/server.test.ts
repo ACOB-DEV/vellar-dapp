@@ -97,7 +97,7 @@ describe("buildCleanupPlan", () => {
   it("counts a non-zero balance as two ops (transfer + trustline) in the estimate", () => {
     // 100 non-zero token balances = 200 ops = 2 cleanup txs + 1 merge.
     const balances = [
-      { assetType: "native", balance: "10.0" },
+      { assetType: "native", balance: "100.0" },
       ...Array.from({ length: 100 }, (_, i) => ({
         assetType: "credit_alphanum4",
         assetCode: `T${i}`,
@@ -191,6 +191,26 @@ describe("POST /lifecycle/plan", () => {
       payload: { accountId: G1, destination: G2 },
     });
     expect(res.statusCode).toBe(404);
+  });
+
+  it("returns 400 when account has insufficient spendable balance to self-fund (#529)", async () => {
+    // 1 subentry, reserve = 1.5 XLM, balance = 1.5 XLM (0 spendable)
+    const unfundedAccount = account({
+      subentryCount: 1,
+      balances: [
+        { assetType: "native", balance: "1.5000000" },
+        { assetType: "credit_alphanum4", assetCode: "USDC", assetIssuer: G2, balance: "0" },
+      ],
+    });
+    const server = build(unfundedAccount);
+    const res = await server.inject({
+      method: "POST",
+      url: "/lifecycle/plan",
+      payload: { accountId: G1, destination: G2 },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("insufficient_spendable_balance");
+    expect(res.json().message).toMatch(/cannot self-fund/i);
   });
 });
 

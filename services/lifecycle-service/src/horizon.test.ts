@@ -97,4 +97,119 @@ describe("createHorizonAccountReader", () => {
     const reader = createHorizonAccountReader(BASE, { fetchImpl, timeoutMs: 5 });
     await expect(reader.getAccount(ACCT)).rejects.toThrow();
   });
+
+  describe("trustline pagination (#531)", () => {
+    it("paginates through all trustline pages covering an account with exactly one more trustline than fits on a single page", async () => {
+      // Single page has 10 trustlines (page 1) + 1 native balance
+      // Page 2 has exactly 1 more trustline (total 11 trustlines)
+      const page1Trustlines = Array.from({ length: 10 }, (_, i) => ({
+        asset_type: "credit_alphanum4",
+        asset_code: `T${i}`,
+        asset_issuer: ACCT,
+        balance: "10.0",
+      }));
+      const accountWithPagedBalances = {
+        sequence: "100",
+        balances: [{ asset_type: "native", balance: "50.0" }, ...page1Trustlines],
+        data: {},
+        _links: {
+          next: { href: `${BASE}/accounts/${ACCT}/balances?cursor=10` },
+        },
+      };
+      const page2Balances = {
+        balances: [
+          {
+            asset_type: "credit_alphanum4",
+            asset_code: "T10",
+            asset_issuer: ACCT,
+            balance: "10.0",
+          },
+        ],
+        _links: { next: { href: "" } },
+      };
+
+      const fetchImpl = vi.fn(async (url: string) => {
+        if (url.includes("/offers")) {
+          return jsonResponse(offerPage([]));
+        }
+        if (url.includes("cursor=10")) {
+          return jsonResponse(page2Balances);
+        }
+        return jsonResponse(accountWithPagedBalances);
+      });
+
+      const reader = createHorizonAccountReader(BASE, { fetchImpl });
+      const account = await reader.getAccount(ACCT);
+
+      expect(account).toBeDefined();
+      // 1 native + 10 from page 1 + 1 from page 2 = 12 total balances (11 trustlines)
+      expect(account?.balances).toHaveLength(12);
+      expect(account?.balances.filter((b) => b.assetType !== "native")).toHaveLength(11);
+      expect(account?.balances[account.balances.length - 1]?.assetCode).toBe("T10");
+    });
+
+    it("safety check: refuses to return account if trustline pagination is cut short by an error partway through", async () => {
+      const accountWithPagedBalances = {
+        sequence: "100",
+        balances: [
+          { asset_type: "native", balance: "50.0" },
+          { asset_type: "credit_alphanum4", asset_code: "T0", asset_issuer: ACCT, balance: "10.0" },
+        ],
+        data: {},
+        _links: {
+          next: { href: `${BASE}/accounts/${ACCT}/balances?cursor=page2` },
+        },
+      };
+
+      const fetchImpl = vi.fn(async (url: string) => {
+        if (url.includes("/offers")) {
+          return jsonResponse(offerPage([]));
+        }
+        if (url.includes("cursor=page2")) {
+          return new Response("", { status: 500 });
+        }
+        return jsonResponse(accountWithPagedBalances);
+      });
+
+      const reader = createHorizonAccountReader(BASE, {
+        fetchImpl,
+        retryOptions: { maxAttempts: 1 },
+      });
+
+      // Must throw/refuse, not silently return the partial trustline list
+      await expect(reader.getAccount(ACCT)).rejects.toThrow(
+        /horizon trustlines pagination failed: pagination was cut short/i,
+      );
+    });
+
+    it("safety check: refuses to return account if a trustline page returns malformed data", async () => {
+      const accountWithPagedBalances = {
+        sequence: "100",
+        balances: [{ asset_type: "native", balance: "50.0" }],
+        data: {},
+        _links: {
+          next: { href: `${BASE}/accounts/${ACCT}/balances?cursor=page2` },
+        },
+      };
+
+      const fetchImpl = vi.fn(async (url: string) => {
+        if (url.includes("/offers")) {
+          return jsonResponse(offerPage([]));
+        }
+        if (url.includes("cursor=page2")) {
+          return jsonResponse({ nonsense: true });
+        }
+        return jsonResponse(accountWithPagedBalances);
+      });
+
+      const reader = createHorizonAccountReader(BASE, {
+        fetchImpl,
+        retryOptions: { maxAttempts: 1 },
+      });
+
+      await expect(reader.getAccount(ACCT)).rejects.toThrow(
+        /horizon trustlines response was malformed/i,
+      );
+    });
+  });
 });
