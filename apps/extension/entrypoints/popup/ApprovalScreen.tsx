@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { browser } from "wxt/browser";
-import { TrustBadge } from "@vellar/ui";
-import type { VerificationStatus } from "@vellar/verification-sdk";
+import { TrustBadge, type TrustBadgeStatus } from "@vellar/ui";
 import type { PendingApprovalSummary } from "../../lib/messages";
 import type { PairedWallet } from "../../lib/state";
 import { sanitizeString } from "../../lib/sanitization";
@@ -117,20 +116,25 @@ function useTxSummary(approval: PendingApprovalSummary): TransactionSummary | nu
   return summary;
 }
 
-/** Trust signal for a contract a transaction will call (§5.5). Best-effort: a
- * lookup failure yields "unverified" so the badge degrades to neutral rather
- * than blocking the review. */
-function useContractTrust(contractId: string | undefined): VerificationStatus {
-  const [status, setStatus] = useState<VerificationStatus>("unverified");
+/** Trust signal for a contract a transaction will call (§5.5). Best-effort: the
+ * lookup is never allowed to block the review — a pending lookup renders as
+ * `loading`, a lookup failure renders as `error` (distinct from `unverified`,
+ * which is a negative result rather than an unknown one). */
+function useContractTrust(contractId: string | undefined): TrustBadgeStatus {
+  const [status, setStatus] = useState<TrustBadgeStatus>(contractId ? "loading" : "unverified");
   useEffect(() => {
-    if (!contractId) return;
+    if (!contractId) {
+      setStatus("unverified");
+      return;
+    }
     let cancelled = false;
+    setStatus("loading");
     void (async () => {
       try {
         const result = await verificationClient().getStatus(contractId);
         if (!cancelled) setStatus(result.status);
       } catch {
-        if (!cancelled) setStatus("unverified");
+        if (!cancelled) setStatus("error");
       }
     })();
     return () => {
