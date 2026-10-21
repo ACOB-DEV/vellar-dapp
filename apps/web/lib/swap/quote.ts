@@ -86,8 +86,14 @@ export function normalizeQuote(input: {
   if (path.length < 2 || path[0] !== sell.contractId || path[path.length - 1] !== buy.contractId) {
     throw new SwapQuoteError("The venue returned a route for different assets.");
   }
-  if (hopAmounts.length !== path.length || hopAmounts[0] !== amountIn) {
+  if (!Array.isArray(hopAmounts) || hopAmounts.length !== path.length || hopAmounts[0] !== amountIn) {
     throw new SwapQuoteError("The venue returned an inconsistent quote.");
+  }
+  // A missing hop must fail here as a typed error — comparing a hole against a
+  // bigint throws a TypeError that would surface as a confusing UI crash rather
+  // than "this quote is unusable".
+  if (hopAmounts.some((a) => typeof a !== "bigint")) {
+    throw new SwapQuoteError("The venue returned an unexpected response.");
   }
   if (hopAmounts.some((a) => a <= 0n)) {
     throw new SwapQuoteError("Not enough liquidity on this route for that amount.");

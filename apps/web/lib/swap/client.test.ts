@@ -3,6 +3,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { assetsFor, findAssetByContractId, type RegisteredAsset } from "@/lib/assets";
 import { candidatePaths, createSwapClient } from "./client";
+import { SwapQuoteError } from "./quote";
 import { SwapVenueError, toVenueError, type SwapVenue } from "./soroswap";
 
 const [XLM, USDC] = assetsFor("testnet") as [RegisteredAsset, RegisteredAsset];
@@ -186,6 +187,48 @@ describe("swap client", () => {
     ).rejects.toThrow(/expired/);
     expect(kit.sign).not.toHaveBeenCalled();
     expect(backend.submitTransaction).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a typed error when the quote response is missing the destination amount", async () => {
+    const v = venue({
+      // Destination asset amount absent: the response has no output to use.
+      getAmountsOut: vi.fn(async (amountIn: bigint) => [amountIn] as bigint[]),
+    });
+    const err = await client(v)
+      .swaps.quote({ sell: XLM, buy: USDC, amountIn: 100_000_000n, resolve })
+      .then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(SwapQuoteError);
+    expect((err as Error).message).toMatch(/inconsistent/i);
+  });
+
+  it("surfaces a typed error rather than undefined when a hop amount is not a bigint", async () => {
+    const v = venue({
+      // The destination amount slot is present but empty — what a partial
+      // decode of a malformed response looks like.
+      getAmountsOut: vi.fn(async (amountIn: bigint) => [amountIn, undefined] as unknown as bigint[]),
+    });
+    const err = await client(v)
+      .swaps.quote({ sell: XLM, buy: USDC, amountIn: 100_000_000n, resolve })
+      .then(() => null, (e: unknown) => e);
+    // Must be a typed quote error, not a TypeError from comparing a hole
+    // against a bigint — a downstream consumer catches SwapQuoteError.
+    expect(err).toBeInstanceOf(SwapQuoteError);
+    expect(err).not.toBeInstanceOf(TypeError);
+    expect((err as Error).message).toMatch(/unexpected response/i);
+  });
+
+  it("parses a quote response that carries an unexpected extra field", async () => {
+    const hopAmounts = [100_000_000n, 10_500_000n] as bigint[] & { extra?: string };
+    hopAmounts.extra = "not part of the schema";
+    const v = venue({ getAmountsOut: vi.fn(async () => hopAmounts) });
+    const q = await client(v).swaps.quote({
+      sell: XLM,
+      buy: USDC,
+      amountIn: 100_000_000n,
+      resolve,
+    });
+    expect(q.expectedOut).toBe(10_500_000n);
+    expect(q.hopAmounts).toEqual([100_000_000n, 10_500_000n]);
   });
 
   it("rejects routes through assets outside the registry", async () => {
