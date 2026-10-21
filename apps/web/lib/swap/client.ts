@@ -135,6 +135,7 @@ export function createSwapClient(deps: SwapClientDeps) {
       const built = await deps.venue.buildSwap({
         amountIn: quote.amountIn,
         minOut: bound.minOut,
+        slippageBps: bound.slippageBps,
         path: quote.path,
         to: from,
         deadline,

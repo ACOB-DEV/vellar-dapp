@@ -82,6 +82,7 @@ describe("swap client", () => {
     expect(v.buildSwap).toHaveBeenCalledWith({
       amountIn: 100_000_000n,
       minOut: 10_395_000n, // 10_500_000 × 0.99
+      slippageBps: 100,
       path: [XLM.contractId, USDC.contractId],
       to: WALLET,
       deadline: 310n, // floor(10_000 ms / 1000) + 300 s
