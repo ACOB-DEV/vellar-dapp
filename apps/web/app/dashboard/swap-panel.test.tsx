@@ -250,18 +250,20 @@ describe("classifySwapFill", () => {
   const AMOUNT_IN = 100_000_000n;
 
   it("classifies a full fill as success, including when output slipped", () => {
-    expect(classifySwapFill({ status: "success", amounts: [AMOUNT_IN, 10_530_000n] }, AMOUNT_IN))
-      .toEqual({ kind: "success", received: 10_530_000n });
+    expect(
+      classifySwapFill({ status: "success", amounts: [AMOUNT_IN, 10_530_000n] }, AMOUNT_IN),
+    ).toEqual({ kind: "success", received: 10_530_000n });
   });
 
   it("classifies a residual source balance as a partial fill", () => {
-    expect(classifySwapFill({ status: "success", amounts: [40_000_000n, 4_200_000n] }, AMOUNT_IN))
-      .toEqual({
-        kind: "partial",
-        filledIn: 40_000_000n,
-        residualIn: 60_000_000n,
-        received: 4_200_000n,
-      });
+    expect(
+      classifySwapFill({ status: "success", amounts: [40_000_000n, 4_200_000n] }, AMOUNT_IN),
+    ).toEqual({
+      kind: "partial",
+      filledIn: 40_000_000n,
+      residualIn: 60_000_000n,
+      received: 4_200_000n,
+    });
   });
 
   it("classifies a 0% fill as rejected, not partial", () => {

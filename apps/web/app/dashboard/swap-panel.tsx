@@ -246,13 +246,38 @@ export function SwapPanel({
             <div className="lpa-well flex flex-col gap-1.5" role="status">
               <p className="lpa-ok m-0! font-bold">Swap partially filled</p>
               <p className="m-0!">
-                Sold {fmt(flow.outcome.filledIn, flow.prepared.review.sell.decimals, flow.prepared.review.sell.symbol)}{" "}
-                of {fmt(flow.prepared.review.amountIn, flow.prepared.review.sell.decimals, flow.prepared.review.sell.symbol)}{" "}
-                and received {fmt(flow.outcome.received, flow.prepared.review.buy.decimals, flow.prepared.review.buy.symbol)}{" "}
-                (expected {fmt(flow.prepared.review.expectedOut, flow.prepared.review.buy.decimals, flow.prepared.review.buy.symbol)}).
+                Sold{" "}
+                {fmt(
+                  flow.outcome.filledIn,
+                  flow.prepared.review.sell.decimals,
+                  flow.prepared.review.sell.symbol,
+                )}{" "}
+                of{" "}
+                {fmt(
+                  flow.prepared.review.amountIn,
+                  flow.prepared.review.sell.decimals,
+                  flow.prepared.review.sell.symbol,
+                )}{" "}
+                and received{" "}
+                {fmt(
+                  flow.outcome.received,
+                  flow.prepared.review.buy.decimals,
+                  flow.prepared.review.buy.symbol,
+                )}{" "}
+                (expected{" "}
+                {fmt(
+                  flow.prepared.review.expectedOut,
+                  flow.prepared.review.buy.decimals,
+                  flow.prepared.review.buy.symbol,
+                )}
+                ).
               </p>
               <p className="m-0!">
-                {fmt(flow.outcome.residualIn, flow.prepared.review.sell.decimals, flow.prepared.review.sell.symbol)}{" "}
+                {fmt(
+                  flow.outcome.residualIn,
+                  flow.prepared.review.sell.decimals,
+                  flow.prepared.review.sell.symbol,
+                )}{" "}
                 remains unswapped in {flow.prepared.review.sell.symbol}.
               </p>
             </div>
