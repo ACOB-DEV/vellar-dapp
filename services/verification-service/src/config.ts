@@ -3,6 +3,8 @@ export interface VerificationServiceRuntimeConfig {
   networkPassphrase: string;
   /** undefined = no Postgres; in-memory repository with a loud warning (dev only). */
   databaseUrl: string | undefined;
+  /** Required positive timeout for verification builds. */
+  buildTimeoutSeconds: number;
 }
 
 const TESTNET_RPC = "https://soroban-testnet.stellar.org";
@@ -15,6 +17,7 @@ export function configFromEnv(
     rpcUrl: env.STELLAR_RPC_URL || TESTNET_RPC,
     networkPassphrase: env.STELLAR_NETWORK_PASSPHRASE || TESTNET_PASSPHRASE,
     databaseUrl: env.DATABASE_URL || undefined,
+    buildTimeoutSeconds,
   };
 }
 
