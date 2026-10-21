@@ -132,9 +132,15 @@ export function worstCaseRate(quote: SwapQuote, bound: SlippageBound): string {
   return formatRate(quote.amountIn, bound.minOut, quote.sell.decimals, quote.buy.decimals);
 }
 
-/** A quote older than this is refused at approval time and must be refreshed. */
+/** Default max age for a quote. A quote older than this is refused at approval
+ * time and must be refreshed. Override per client with `maxQuoteAgeMs`. */
 export const QUOTE_TTL_MS = 30_000;
 
-export function isQuoteFresh(quote: SwapQuote, now: number): boolean {
-  return now - quote.quotedAt <= QUOTE_TTL_MS;
+/**
+ * Whether `quote` is still within `maxAgeMs` of `now`. Checked immediately
+ * before the signable transaction is built, so a quote that aged out between
+ * fetch and approval forces a re-quote rather than signing a stale price.
+ */
+export function isQuoteFresh(quote: SwapQuote, now: number, maxAgeMs: number = QUOTE_TTL_MS): boolean {
+  return now - quote.quotedAt <= maxAgeMs;
 }

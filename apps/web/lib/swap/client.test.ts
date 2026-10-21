@@ -158,6 +158,36 @@ describe("swap client", () => {
     );
   });
 
+  it("forces a re-quote when the quote exceeds the configured max age", async () => {
+    let t = 0;
+    const kit = { sign: vi.fn(async (tx: unknown) => ({ signed: tx })) };
+    const backend = { submitTransaction: vi.fn(async () => ({ hash: "swaphash" })) };
+    const swaps = createSwapClient({
+      venue: venue(),
+      kit,
+      backend,
+      network: "testnet",
+      signedToXdr: () => "SIGNED_XDR",
+      now: () => t,
+      maxQuoteAgeMs: 5_000,
+    });
+
+    const quote = await swaps.quote({ sell: XLM, buy: USDC, amountIn: 10_000_000n, resolve });
+
+    // Exactly at the boundary age: still signable.
+    t = 5_000;
+    const prepared = await swaps.prepare({ from: WALLET, quote, slippageBps: 50, resolve });
+    expect(prepared.review.minOut).toBeGreaterThan(0n);
+
+    // One millisecond past it: refused, and nothing is signed.
+    t = 5_001;
+    await expect(
+      swaps.prepare({ from: WALLET, quote, slippageBps: 50, resolve }),
+    ).rejects.toThrow(/expired/);
+    expect(kit.sign).not.toHaveBeenCalled();
+    expect(backend.submitTransaction).not.toHaveBeenCalled();
+  });
+
   it("rejects routes through assets outside the registry", async () => {
     const v = venue();
     const { swaps } = client(v);
