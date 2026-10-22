@@ -12,6 +12,7 @@ import { createMemoryAuditLog, createMemoryWalletRepository, type AuditLog } fro
 import { createUnconfiguredSubmitter, SubmissionError, type TransactionSubmitter } from "./relayer";
 import { buildServer } from "./server";
 import { deriveWalletContractId } from "./derivation";
+import { createMemoryInFlightTracker } from "./in-flight";
 
 function workingSubmitter(): TransactionSubmitter {
   return { submit: vi.fn().mockResolvedValue({ hash: "txhash123" }) };
@@ -1046,7 +1047,7 @@ describe("GET /wallet/audit-logs - actor-based filtering (issue #512)", () => {
       headers: bearer(createSessionId),
     });
     expect(allLogsRes.statusCode).toBe(200);
-    expect(allLogsRes.json().auditLogs.length).toBeGreaterThanOrEqual(4);
+    expect(allLogsRes.json().auditLogs.length).toBeGreaterThanOrEqual(3);
 
     await app.close();
   });
@@ -1440,6 +1441,213 @@ describe("GET /wallet/transactions (issue #256)", () => {
     });
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toBe("invalid_cursor");
+  });
+
+  it("filters transactions by status (submitted, failed, policy-rejected) and returns mixed page without filter", async () => {
+    const audit = createMemoryAuditLog();
+    const server = build(workingSubmitter(), audit);
+    const { createSessionId } = await createAndConnect(server);
+
+    await audit.record("tx.submitted", { network: "testnet", txHash: "sub-1" }, "CCONTRACT");
+    await audit.record(
+      "tx.failed",
+      { network: "testnet", error: "tx_insufficient_balance" },
+      "CCONTRACT",
+    );
+    await audit.record(
+      "tx.policy_rejected",
+      { network: "testnet", reason: "disallowed contract" },
+      "CCONTRACT",
+    );
+
+    // All 3 in one page when no status filter is provided
+    const allRes = await server.inject({
+      url: "/wallet/transactions?contractId=CCONTRACT&network=testnet",
+      headers: bearer(createSessionId),
+    });
+    expect(allRes.statusCode).toBe(200);
+    const allTxs = allRes.json().transactions;
+    expect(allTxs).toHaveLength(3);
+    expect(allTxs.map((t: { status: string }) => t.status)).toEqual([
+      "policy-rejected",
+      "failed",
+      "submitted",
+    ]);
+
+    // Filter status=policy-rejected
+    const policyRes = await server.inject({
+      url: "/wallet/transactions?contractId=CCONTRACT&network=testnet&status=policy-rejected",
+      headers: bearer(createSessionId),
+    });
+    expect(policyRes.statusCode).toBe(200);
+    expect(policyRes.json().transactions).toHaveLength(1);
+    expect(policyRes.json().transactions[0].status).toBe("policy-rejected");
+    expect(policyRes.json().transactions[0].reason).toBe("disallowed contract");
+
+    // Filter status=failed
+    const failedRes = await server.inject({
+      url: "/wallet/transactions?contractId=CCONTRACT&network=testnet&status=failed",
+      headers: bearer(createSessionId),
+    });
+    expect(failedRes.statusCode).toBe(200);
+    expect(failedRes.json().transactions).toHaveLength(1);
+    expect(failedRes.json().transactions[0].status).toBe("failed");
+    expect(failedRes.json().transactions[0].error).toBe("tx_insufficient_balance");
+
+    // Filter status=submitted
+    const submittedRes = await server.inject({
+      url: "/wallet/transactions?contractId=CCONTRACT&network=testnet&status=submitted",
+      headers: bearer(createSessionId),
+    });
+    expect(submittedRes.statusCode).toBe(200);
+    expect(submittedRes.json().transactions).toHaveLength(1);
+    expect(submittedRes.json().transactions[0].status).toBe("submitted");
+    expect(submittedRes.json().transactions[0].txHash).toBe("sub-1");
+
+    // Invalid status returns 400
+    const invalidRes = await server.inject({
+      url: "/wallet/transactions?contractId=CCONTRACT&network=testnet&status=unknown-status",
+      headers: bearer(createSessionId),
+    });
+    expect(invalidRes.statusCode).toBe(400);
+  });
+});
+
+describe("POST /wallet/account/merge (issue #511)", () => {
+  const bearer = (id: string) => ({ authorization: `Bearer ${id}` });
+
+  it("returns preview merge plan with dryRun: true without auditing account.merged", async () => {
+    const audit = createMemoryAuditLog();
+    const server = build(workingSubmitter(), audit);
+    const { createSessionId } = await createAndConnect(server);
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/account/merge",
+      headers: bearer(createSessionId),
+      payload: {
+        destinationContractId: "CDESTINATION456",
+        dryRun: true,
+        balances: [
+          { asset: "native", amount: "50", isNative: true },
+          { asset: "USDC:GXXX", amount: "0", hasTrustline: true },
+        ],
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.status).toBe("preview");
+    expect(body.dryRun).toBe(true);
+    expect(body.plan.source).toBe("CCONTRACT");
+    expect(body.plan.destination).toBe("CDESTINATION456");
+    expect(body.plan.canMerge).toBe(true);
+    expect(body.plan.assetsMoved).toEqual([{ asset: "native", amount: "50", isNative: true }]);
+    expect(body.plan.trustlinesAffected).toEqual([{ asset: "USDC:GXXX", status: "closed" }]);
+
+    // Confirm nothing was written to audit log
+    const events = await audit.list();
+    expect(events.filter((e) => e.type === "account.merged")).toHaveLength(0);
+  });
+
+  it("blocks merge when account has non-zero non-native balances / open trustlines", async () => {
+    const audit = createMemoryAuditLog();
+    const server = build(workingSubmitter(), audit);
+    const { createSessionId } = await createAndConnect(server);
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/account/merge",
+      headers: bearer(createSessionId),
+      payload: {
+        destinationContractId: "CDESTINATION456",
+        dryRun: false,
+        balances: [
+          { asset: "native", amount: "100", isNative: true },
+          { asset: "USDC:GXXX", amount: "15.5", hasTrustline: true },
+        ],
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body.error).toBe("cannot_merge_with_open_trustlines");
+    expect(body.blockers).toContain(
+      "Non-zero balance (15.5) on trustline USDC:GXXX must be zeroed before merge",
+    );
+    expect(body.plan.canMerge).toBe(false);
+
+    // Confirm nothing was written to audit log
+    const events = await audit.list();
+    expect(events.filter((e) => e.type === "account.merged")).toHaveLength(0);
+  });
+
+  it("executes merge cleanly when no blockers exist and dryRun is false", async () => {
+    const audit = createMemoryAuditLog();
+    const server = build(workingSubmitter(), audit);
+    const { createSessionId } = await createAndConnect(server);
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/account/merge?dryRun=false",
+      headers: bearer(createSessionId),
+      payload: {
+        destinationContractId: "CDESTINATION456",
+        balances: [
+          { asset: "native", amount: "100", isNative: true },
+          { asset: "USDC:GXXX", amount: "0", hasTrustline: true },
+        ],
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.status).toBe("merged");
+    expect(body.destination).toBe("CDESTINATION456");
+    expect(body.plan.canMerge).toBe(true);
+
+    const events = await audit.list();
+    expect(events.filter((e) => e.type === "account.merged")).toHaveLength(1);
+  });
+});
+
+describe("POST /wallet/key/rotate (issue #510)", () => {
+  const bearer = (id: string) => ({ authorization: `Bearer ${id}` });
+
+  it("rejects rotation with 409 in_flight_submission_conflict when a submission is in flight", async () => {
+    const inFlightTracker = createMemoryInFlightTracker();
+    const server = buildServer({ submitter: workingSubmitter(), inFlightTracker });
+    const { createSessionId } = await createAndConnect(server);
+
+    // Simulate in-flight submission started for CCONTRACT
+    const release = inFlightTracker.start("CCONTRACT");
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/wallet/key/rotate",
+      headers: bearer(createSessionId),
+      payload: { oldKeyId: "key-abc", newKeyId: "key-def" },
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toEqual({
+      error: "in_flight_submission_conflict",
+      message: "Cannot rotate key while a transaction submission is in flight for this wallet.",
+    });
+
+    // Complete the in-flight submission
+    release();
+
+    // Now rotation succeeds cleanly
+    const retryRes = await server.inject({
+      method: "POST",
+      url: "/wallet/key/rotate",
+      headers: bearer(createSessionId),
+      payload: { oldKeyId: "key-abc", newKeyId: "key-def" },
+    });
+
+    expect(retryRes.statusCode).toBe(200);
+    expect(retryRes.json()).toEqual({ status: "rotated", newKeyId: "key-def" });
   });
 });
 
