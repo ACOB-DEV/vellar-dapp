@@ -525,3 +525,87 @@ function Row({ label, value }: { label: string; value: string }) {
     </div>
   );
 }
+
+// --- Key expiry countdown (#571) --------------------------------------------
+//
+// A key nearing its expiry is operationally important for anyone relying on an
+// autonomous agent: the budget silently stops working at expiry. The indicator
+// is deliberately pure (status + formatting) so it is unit-testable without a
+// clock, then rendered next to the key's expiry date in the agent-key list.
+
+/** How close to expiry counts as "nearing". Configurable per render/test. */
+export const DEFAULT_EXPIRY_WARNING_MS = 24 * 60 * 60 * 1000;
+
+export type ExpiryStatus = "none" | "ok" | "warning" | "expired";
+
+export function expiryStatus(
+  expiresAt: string | undefined | null,
+  nowMs: number,
+  thresholdMs: number = DEFAULT_EXPIRY_WARNING_MS,
+): ExpiryStatus {
+  if (!expiresAt) return "none";
+  const at = new Date(expiresAt).getTime();
+  if (Number.isNaN(at)) return "none";
+  const remaining = at - nowMs;
+  if (remaining <= 0) return "expired";
+  return remaining <= thresholdMs ? "warning" : "ok";
+}
+
+/** Compact human remaining time: "2d 3h", "5h 12m", "12m", "under 1m". */
+export function formatTimeRemaining(remainingMs: number): string {
+  const totalMinutes = Math.floor(remainingMs / 60_000);
+  if (totalMinutes < 1) return "under 1m";
+  const days = Math.floor(totalMinutes / (60 * 24));
+  const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  return `${minutes}m`;
+}
+
+/** Visual expiry indicator: countdown + colour. Distinct for already-expired
+ * vs nearing expiry; renders "No expiry" (no countdown) when unset. */
+export function AgentKeyExpiry({
+  expiresAt,
+  nowMs = Date.now(),
+  thresholdMs = DEFAULT_EXPIRY_WARNING_MS,
+}: {
+  expiresAt?: string;
+  nowMs?: number;
+  thresholdMs?: number;
+}) {
+  const status = expiryStatus(expiresAt, nowMs, thresholdMs);
+  if (status === "none") {
+    return (
+      <span
+        data-testid="agent-key-expiry"
+        data-expiry-status="none"
+        className="text-[var(--lp-ink-faint)]"
+      >
+        No expiry
+      </span>
+    );
+  }
+  const at = new Date(expiresAt!).getTime();
+  if (status === "expired") {
+    return (
+      <span
+        data-testid="agent-key-expiry"
+        data-expiry-status="expired"
+        className="font-bold text-red-700"
+      >
+        Expired {formatTimeRemaining(nowMs - at)} ago
+      </span>
+    );
+  }
+  const remaining = formatTimeRemaining(at - nowMs);
+  return (
+    <span
+      data-testid="agent-key-expiry"
+      data-expiry-status={status}
+      className={status === "warning" ? "font-bold text-amber-700" : "text-[var(--lp-ink-soft)]"}
+    >
+      Expires in {remaining}
+    </span>
+  );
+}
