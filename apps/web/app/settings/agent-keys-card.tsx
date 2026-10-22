@@ -1,6 +1,6 @@
 "use client";
 
-import { useReducer, useState } from "react";
+import { useReducer, useRef, useState } from "react";
 import type { WalletSession } from "@vellar/types";
 import { formatTokenAmount, parseTokenAmount, type TokenInfo } from "vellar-sdk";
 import { isUserCancellation } from "@vellar/passkey";
@@ -13,6 +13,7 @@ import {
   runMint,
   type MintConfig,
   type MintEffects,
+  type MintSummary,
 } from "@/lib/agent-mint";
 import { useBalances } from "@/lib/balances";
 import { getWalletRuntime } from "@/lib/connector-factory";
@@ -65,6 +66,8 @@ export function AgentKeysCard({ session }: { session: WalletSession }) {
   const [windowIdx, setWindowIdx] = useState(1);
   const [formError, setFormError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [pendingSummary, setPendingSummary] = useState<MintSummary | null>(null);
+  const confirmResolver = useRef<((ok: boolean) => void) | null>(null);
 
   const tokens: TokenInfo[] = balances.data ?? [];
   const token = tokens.find((t) => t.contractId === tokenId) ?? tokens[0];
@@ -112,6 +115,7 @@ export function AgentKeysCard({ session }: { session: WalletSession }) {
     return {
       token: token.contractId,
       tokenSymbol: token.symbol,
+      tokenDecimals: token.decimals,
       amountBaseUnits: base.toString(),
       windowSeconds: win.seconds,
       expiresAtSeconds: expiry.seconds ? Math.floor(Date.now() / 1000) + expiry.seconds : undefined,
@@ -150,6 +154,17 @@ export function AgentKeysCard({ session }: { session: WalletSession }) {
       },
       simulateDeploy: simulatePolicyDeploy,
       deployInstance: deployPolicyInstance,
+      async confirmDetails(summary) {
+        setPendingSummary(summary);
+        await new Promise<void>((resolve, reject) => {
+          confirmResolver.current = (ok) => {
+            confirmResolver.current = null;
+            setPendingSummary(null);
+            if (ok) resolve();
+            else reject(new Error("Mint cancelled: budget details were not confirmed."));
+          };
+        });
+      },
       async attachPolicy(policyContractId) {
         const runtime = await getWalletRuntime();
         if (session.keyId) await runtime.resume(session.keyId);
@@ -329,6 +344,41 @@ export function AgentKeysCard({ session }: { session: WalletSession }) {
           {"detail" in state && (
             <p className="m-0! animate-pulse text-xs text-[var(--lp-ink-soft)]">{state.detail}</p>
           )}
+          {state.step === "awaiting-confirmation" && pendingSummary && (
+            <div
+              className="lpa-well m-0! flex flex-col gap-2 text-xs"
+              data-testid="mint-confirm-summary"
+            >
+              <p className="m-0! font-bold">
+                Confirm the exact budget and expiry before signing
+              </p>
+              <dl className="m-0! flex flex-col gap-1">
+                <Row label="Asset" value={`${pendingSummary.tokenLabel} (${pendingSummary.tokenId})`} />
+                <Row label="Budget" value={`${pendingSummary.budgetLabel} ${pendingSummary.windowLabel}`} />
+                <Row label="Expires" value={pendingSummary.expiryLabel} />
+              </dl>
+              <p className="m-0! text-xs text-[var(--lp-ink-soft)]">
+                This is exactly what the mint transaction will encode. Nothing is signed until you
+                confirm.
+              </p>
+              <div className="flex gap-2.5">
+                <LpActionButton
+                  size="sm"
+                  onClick={() => confirmResolver.current?.(true)}
+                  data-testid="confirm-mint-details"
+                >
+                  Confirm and sign
+                </LpActionButton>
+                <LpActionButton
+                  variant="outline"
+                  size="sm"
+                  onClick={() => confirmResolver.current?.(false)}
+                >
+                  Cancel
+                </LpActionButton>
+              </div>
+            </div>
+          )}
           {state.step === "confirming" && (
             <p className="m-0! animate-pulse text-xs text-[var(--lp-ink-soft)]">
               Confirming on the network… policy {state.attachTxHash} · signer{" "}
@@ -438,6 +488,7 @@ export function AgentKeysCard({ session }: { session: WalletSession }) {
 const STAGE_LABEL = {
   "creating-key": "generating the agent key",
   "policy-creation": "deploying the budget policy",
+  "awaiting-confirmation": "waiting for your confirmation",
   "attaching-policy": "attaching the policy",
   "adding-signer": "adding the agent signer",
   confirming: "confirming on the network",
@@ -449,6 +500,8 @@ function stepLabel(step: string, prompt?: "attach-policy" | "add-signer"): strin
       return "Generating agent key…";
     case "policy-creation":
       return "Deploying budget policy…";
+    case "awaiting-confirmation":
+      return "Confirm the budget details…";
     case "awaiting-passkey-approval":
       return prompt === "add-signer"
         ? "Approve the agent signer with your passkey…"
