@@ -112,6 +112,7 @@ export const providerErrorCodeSchema = z.enum([
   "disconnected", // no wallet is paired/connected in the extension
   "invalid_request", // schema validation failed
   "internal", // unexpected failure
+  "paired_origin_limit_reached", // wallet already has the max paired dApp origins (#579)
 ]);
 
 export type ProviderErrorCode = z.infer<typeof providerErrorCodeSchema>;
