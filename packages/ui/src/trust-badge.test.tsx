@@ -32,6 +32,30 @@ describe("TrustBadge", () => {
     expect(badge.getAttribute("data-tone")).toBe("neutral");
   });
 
+  it("renders a never-verified contract with a visually distinct tone from an explicitly-failed one (#587)", () => {
+    render(<TrustBadge status="unverified" />);
+    const neverVerified = screen.getByRole("status");
+    cleanup();
+
+    render(<TrustBadge status="failed" />);
+    const explicitlyFailed = screen.getByRole("status");
+
+    expect(neverVerified.getAttribute("data-tone")).not.toBe(
+      explicitlyFailed.getAttribute("data-tone"),
+    );
+    expect(neverVerified.textContent).not.toBe(explicitlyFailed.textContent);
+  });
+
+  it("treats a dead-lettered verification job as a warning, not as unverified/neutral (#587)", () => {
+    // A dead_letter job genuinely failed after exhausting retries; it must
+    // not render identically to a contract that was never submitted at
+    // all.
+    render(<TrustBadge status="dead_letter" />);
+    const badge = screen.getByRole("status");
+    expect(badge.getAttribute("data-tone")).toBe("warning");
+    expect(badge.textContent).toContain("Verification failed");
+  });
+
   it("exposes an accessible label describing the trust status", () => {
     render(<TrustBadge status="verified" />);
     expect(screen.getByLabelText("Contract trust status: Verified source")).toBeTruthy();

@@ -127,6 +127,14 @@ export function trustSignal(status: VerificationStatus): {
       return { label: "Verified source", tone: "verified" };
     case "failed":
       return { label: "Verification failed", tone: "warning" };
+    case "dead_letter":
+      // A job reclaimed and re-run VERIFY_MAX_ATTEMPTS times without
+      // reaching a terminal state (see VerificationStatus's doc comment).
+      // This attempt genuinely failed, repeatedly, not merely "never
+      // submitted." Previously fell through to the unverified/neutral
+      // default below, misrepresenting a confirmed failure as an unchecked
+      // contract (#587).
+      return { label: "Verification failed", tone: "warning" };
     case "submitted":
     case "building":
       return { label: "Verification in progress", tone: "pending" };

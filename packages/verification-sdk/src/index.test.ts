@@ -97,4 +97,21 @@ describe("trustSignal", () => {
     expect(trustSignal("building").tone).toBe("pending");
     expect(trustSignal("unverified")).toEqual({ label: "Unverified", tone: "neutral" });
   });
+
+  it("gives never-verified (unverified) a distinct, lower-severity tone than explicitly-failed verification (#587)", () => {
+    const unverified = trustSignal("unverified");
+    const failed = trustSignal("failed");
+    expect(unverified.tone).toBe("neutral");
+    expect(failed.tone).toBe("warning");
+    expect(unverified.tone).not.toBe(failed.tone);
+    expect(unverified.label).not.toBe(failed.label);
+  });
+
+  it("treats dead_letter as a failure, not as unverified/neutral (#587)", () => {
+    // A dead_letter job genuinely failed after exhausting retries; it must
+    // not silently fall through to the unverified default, which would
+    // misrepresent a confirmed failure as an unchecked contract.
+    expect(trustSignal("dead_letter")).toEqual(trustSignal("failed"));
+    expect(trustSignal("dead_letter").tone).not.toBe(trustSignal("unverified").tone);
+  });
 });
