@@ -11,7 +11,9 @@ export interface KeyValueStore {
   set(key: string, value: unknown): Promise<void>;
 }
 
-const STATE_KEY = "vela.extension.state";
+/** Exported so callers can watch for live changes (e.g. browser.storage.onChanged
+ * in App.tsx, #588) without duplicating the key literal. */
+export const STATE_KEY = "vela.extension.state";
 
 export const pairedWalletSchema = z.object({
   address: z.string().min(1),

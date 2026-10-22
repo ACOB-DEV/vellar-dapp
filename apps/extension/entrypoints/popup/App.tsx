@@ -6,7 +6,7 @@ import { browser } from "wxt/browser";
 import type { PermissionGrant } from "@vellar/provider-sdk";
 import { browserKv } from "../../lib/browser-kv";
 import type { PendingApprovalSummary } from "../../lib/messages";
-import { loadState, revokeGrant, type ExtensionState } from "../../lib/state";
+import { loadState, revokeGrant, STATE_KEY, type ExtensionState } from "../../lib/state";
 import { ApprovalScreen } from "./ApprovalScreen";
 import { HomeScreen } from "./HomeScreen";
 
@@ -32,6 +32,20 @@ export function App() {
 
   useEffect(() => {
     void refresh();
+  }, [refresh]);
+
+  // A pairing/approval can land while this popup instance is already open —
+  // e.g. the user approves a connection in a separate approval window, or
+  // the web app pairs a new grant directly. browser.storage.onChanged fires
+  // in every open extension context, so an already-open popup's "Connected
+  // dApps" list updates immediately instead of requiring it to be closed
+  // and reopened (#588).
+  useEffect(() => {
+    const onChanged = (changes: Record<string, unknown>, areaName: string) => {
+      if (areaName === "local" && STATE_KEY in changes) void refresh();
+    };
+    browser.storage.onChanged.addListener(onChanged);
+    return () => browser.storage.onChanged.removeListener(onChanged);
   }, [refresh]);
 
   const isApprovalWindow = new URLSearchParams(window.location.search).has("approval");
