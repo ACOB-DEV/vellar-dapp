@@ -24,13 +24,17 @@ const TONE_COLORS: Record<Tone, { fg: string; bg: string; dot: string }> = {
  * are not verification outcomes: `loading` while the lookup is in flight, and
  * `error` when the lookup itself fails. `error` is deliberately distinct from
  * `unverified` — "couldn't check" is not the same claim as "checked and not
- * verified".
+ * verified". `no_record` is likewise distinct from `unverified`: it means the
+ * lookup succeeded and found no verification record at all for this contract,
+ * as opposed to a contract that was explicitly checked and flagged unverified
+ * (see classifyContractTrust in the extension's lib/verification.ts).
  */
-export type TrustBadgeStatus = VerificationStatus | "loading" | "error";
+export type TrustBadgeStatus = VerificationStatus | "loading" | "error" | "no_record";
 
 function signalFor(status: TrustBadgeStatus): { label: string; tone: Tone } {
   if (status === "loading") return { label: "Checking verification…", tone: "pending" };
   if (status === "error") return { label: "Couldn't check verification", tone: "error" };
+  if (status === "no_record") return { label: "No verification record", tone: "neutral" };
   return trustSignal(status);
 }
 
